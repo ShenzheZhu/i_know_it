@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "I Know It!",
+  "version": "0.1.0",
+  "description": "Capture a web region and copy its local image path and Markdown context for your coding agent.",
+  "permissions": ["activeTab", "scripting", "clipboardWrite", "downloads", "storage"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Capture with context" },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "Capture with context"
+    }
+  }
+}

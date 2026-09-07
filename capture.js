@@ -76,6 +76,12 @@ stage.addEventListener("pointerup", event => {
   catch (error) { status.textContent = error.message; }
 });
 stage.addEventListener("pointercancel", () => { start = undefined; selection.hidden = true; });
+window.addEventListener("resize", () => {
+  if (!start) return;
+  start = undefined;
+  selection.hidden = true;
+  status.textContent = "Window resized. Drag to select a region again.";
+});
 $("full").onclick = () => { selection.hidden = true; void finish({ x: 0, y: 0, ...pixels() }); };
 $("copy").onclick = () => copy().catch(error => { status.textContent = `Copy failed. Copy the text below manually: ${error.message}`; });
 $("close").onclick = () => window.close();

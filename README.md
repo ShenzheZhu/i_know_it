@@ -20,13 +20,17 @@ The clipboard contains **Markdown text and an image path**, not an image attachm
 
 Only the current viewport is captured. There is no scrolling capture, DOM or React analysis, native app capture, or system screenshot monitoring. Chrome internal pages and other pages that block script injection show an error. Standard browser page zoom is supported; reset trackpad pinch zoom before capturing.
 
+Coordinates describe the page at capture time. Window size, fullscreen, display density, and browser zoom can change the viewport; cropping uses the actual screenshot dimensions to map back to CSS pixels. Resizing the preview window during a drag cancels that selection so you can draw it again.
+
 No network service, MCP, API key, third-party dependencies, or telemetry. The extension reads the current page only when you trigger a capture. The downloads permission saves its screenshots and retrieves their actual file paths; it does not read other downloads. Screenshots remain on disk until you delete them.
 
 ## Checks
 
-Run `node check.mjs` in this directory to check selection scaling, scroll coordinates, and Markdown output.
+Run `node check.mjs` to check selection scaling, scroll coordinates, Markdown output, and five viewport/density/zoom combinations.
 
-The extension button, screenshot capture, region cropping, PNG saving, absolute file paths, and clipboard text have been verified in a separate Chromium test profile. Pasting into the native Codex and Claude Code inputs has not been verified with automation. The output is plain text that directs a local agent to read the image by its path.
+Browser acceptance checks passed in a separate Chrome for Testing profile: toolbar capture, cropping, PNG saving, absolute paths, clipboard text and ordinary paste, visible-page capture, 800×600 / 1200×800 / 1920×1080 viewports, 125% zoom, cancellation during resize, Escape, and restricted-page errors. A local Codex CLI run received the generated Markdown and correctly read a random code and button label present only in the screenshot.
+
+Native Codex desktop input automation was unavailable. Claude Code acceptance stopped at an expired OAuth token before image reading. Neither native input flow is claimed as verified. Physical monitor switching and OS fullscreen transitions have not been tested.
 
 ## License
 

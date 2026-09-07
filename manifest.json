@@ -1,15 +1,39 @@
 {
   "manifest_version": 3,
   "name": "I Know It!",
-  "version": "0.1.0",
-  "description": "Capture a web region and copy its local image path and Markdown context for your coding agent.",
-  "permissions": ["activeTab", "scripting", "clipboardWrite", "downloads", "storage"],
-  "background": { "service_worker": "background.js", "type": "module" },
-  "action": { "default_title": "Capture with context" },
-  "commands": {
-    "_execute_action": {
-      "suggested_key": { "default": "Alt+Shift+S" },
-      "description": "Capture with context"
+  "version": "0.3.0",
+  "minimum_chrome_version": "120",
+  "description": "Add source context to ordinary screenshots through a local background companion.",
+  "permissions": [
+    "nativeMessaging",
+    "tabs",
+    "scripting",
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "incognito": "not_allowed",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "I Know It! — On. Click to turn off."
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "context.js"
+      ],
+      "run_at": "document_start"
     }
-  }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwHH+cc/6W7AOBIjwTEsufpfCl9gfThZNi4F6YIz+yVaRABmXV/QqA/SY0M80J96qJzf9/9541Pgq9gZz0aJlt0SUc1FMhKXzDddTUra+Bw4MYHHwTYayTZciqd5ZfSrJBtLPkutkbHZhjDBZgAFTf12t5NsqDWTJQIQrBBaUCeh9Nl3qlxpe2dKiAQ4W3wB5/MEBHaprc44lchkCN1tUThhtcW2iYSNICRkP0SvVm8uAoHrye2DGeGkY/uvb1uaBcVyObaVl3qtwfxIZIQSQKGNFYZ8ciiBzUF99KkVp+vaf0uYZvwXSggdowMcFW58Z6eTLAuUZXu0uem6xrONJNQIDAQAB"
 }

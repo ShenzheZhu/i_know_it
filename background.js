@@ -1,43 +1,138 @@
-function pageContext() {
+let enabled = false;
+let port;
+let timer;
+let revision = 0;
+
+function send(message) {
+  try { port?.postMessage(message); } catch { /* Reconnect on the next alarm. */ }
+}
+
+function unavailable(window, tabId) {
   return {
-    url: location.href,
-    title: document.title,
-    viewport: { width: innerWidth, height: innerHeight },
-    scroll: { x: scrollX, y: scrollY },
-    devicePixelRatio,
-    visualScale: visualViewport?.scale ?? 1,
+    type: 'browser-context', observedAt: new Date().toISOString(), available: false,
+    ...(window && {
+      windowId: window.id, tabId,
+      window: Object.fromEntries(['focused', 'left', 'top', 'width', 'height', 'state']
+        .map((key) => [key, window[key]])),
+    }),
   };
 }
 
-let capturing = false;
-chrome.action.onClicked.addListener(async (tab) => {
-  if (capturing) return;
-  capturing = true;
-  const id = crypto.randomUUID();
+function pageContext() {
+  return {
+    url: location.href, title: document.title,
+    viewport: { width: innerWidth, height: innerHeight },
+    scroll: { x: scrollX, y: scrollY }, devicePixelRatio,
+    visualViewport: {
+      scale: visualViewport?.scale ?? 1,
+      offsetLeft: visualViewport?.offsetLeft ?? 0,
+      offsetTop: visualViewport?.offsetTop ?? 0,
+    },
+  };
+}
+
+async function readContext(version, requestId) {
+  let context = unavailable();
   try {
-    await chrome.action.setBadgeText({ text: "", tabId: tab.id });
-    const read = async () => (await chrome.scripting.executeScript({
-      target: { tabId: tab.id }, func: pageContext,
-    }))[0].result;
-    const context = await read();
-    if (context.visualScale !== 1) throw new Error("Reset trackpad pinch zoom before capturing.");
-    const zoom = await chrome.tabs.getZoom(tab.id);
-    const timestamp = new Date().toISOString();
-    const image = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
-    const [active] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-    if (active?.id !== tab.id || JSON.stringify(context) !== JSON.stringify(await read())) {
-      throw new Error("The page changed during capture. Please try again.");
+    if (!enabled) throw new Error('Disabled');
+    const window = await chrome.windows.getLastFocused({ populate: true });
+    const tab = window.tabs?.find((item) => item.active);
+    context = unavailable(window, tab?.id);
+    if (window.focused && !window.incognito && tab && !tab.incognito
+      && tab.status === 'complete' && /^https?:\/\//.test(tab.url ?? '')) {
+      const observedAt = new Date().toISOString();
+      const [results, zoom] = await Promise.all([
+        chrome.scripting.executeScript({ target: { tabId: tab.id }, func: pageContext }),
+        chrome.tabs.getZoom(tab.id),
+      ]);
+      const current = await chrome.windows.getLastFocused({ populate: true });
+      const active = current.tabs?.find((item) => item.active);
+      const page = results.find((item) => item.frameId === 0)?.result;
+      if (current.focused && current.id === window.id && active?.id === tab.id
+        && active.status === 'complete' && active.url === tab.url && page?.url === tab.url
+        && ['left', 'top', 'width', 'height', 'state'].every((key) => current[key] === window[key])) {
+        context = { ...context, ...page, observedAt, available: true, zoom };
+      } else {
+        context = unavailable(current, active?.id);
+      }
     }
-    // Only the pending capture is stored; opening the selection page consumes it.
-    await chrome.storage.session.clear();
-    await chrome.storage.session.set({ [id]: { image, context: { ...context, timestamp, zoom } } });
-    await chrome.tabs.create({ url: chrome.runtime.getURL(`capture.html#${id}`) });
-  } catch (error) {
-    await chrome.storage.session.remove(id);
-    await chrome.action.setBadgeText({ text: "!", tabId: tab.id }).catch(() => {});
-    await chrome.action.setTitle({ title: `Capture failed: ${error.message}`, tabId: tab.id }).catch(() => {});
-    await chrome.tabs.create({ url: chrome.runtime.getURL(`capture.html#error=${encodeURIComponent(error.message)}`) });
-  } finally {
-    capturing = false;
-  }
+  } catch { /* Restricted pages and closing tabs have no page context. */ }
+  if (requestId) {
+    send({ ...(enabled && version === revision ? context : unavailable()), requestId });
+  } else if (enabled && version === revision) send(context);
+}
+
+function refresh(invalidate = false) {
+  revision++;
+  if (!enabled) return;
+  if (invalidate) send(unavailable());
+  clearTimeout(timer);
+  timer = setTimeout(() => { void readContext(revision); }, 60);
+}
+
+function connect() {
+  if (port) return;
+  try {
+    const connection = chrome.runtime.connectNative('com.iknowit.bridge');
+    port = connection;
+    connection.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError;
+      if (port === connection) port = undefined;
+    });
+    connection.onMessage.addListener((message) => {
+      if (message?.type !== 'request-context') return;
+      if (typeof message.requestId === 'string' && message.requestId.length <= 128) {
+        void readContext(revision, message.requestId);
+      } else refresh();
+    });
+    send({ type: 'enabled', enabled });
+    refresh(true);
+  } catch { /* The installer may not have registered the host yet. */ }
+}
+
+function updateButton() {
+  return Promise.all([
+    chrome.action.setBadgeText({ text: enabled ? 'ON' : 'OFF' }),
+    chrome.action.setTitle({ title: `I Know It! — ${enabled ? 'On. Click to turn off.' : 'Off. Click to turn on.'}` }),
+  ]);
+}
+
+const ready = chrome.storage.local.get({ enabled: true }).then(async (settings) => {
+  enabled = settings.enabled !== false;
+  await updateButton();
+  await chrome.alarms.create('native-reconnect', { periodInMinutes: 0.5 });
+  connect();
+});
+
+let toggling = ready;
+chrome.action.onClicked.addListener(() => {
+  const operation = toggling.then(async () => {
+    enabled = !enabled;
+    revision++;
+    clearTimeout(timer);
+    send({ type: 'enabled', enabled });
+    await Promise.all([chrome.storage.local.set({ enabled }), updateButton()]);
+    connect();
+    if (enabled) refresh(true);
+  });
+  toggling = operation.catch(() => {});
+  return operation;
+});
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'native-reconnect') { await ready; connect(); }
+});
+chrome.runtime.onInstalled.addListener(() => { void ready.then(() => refresh(true)); });
+chrome.runtime.onStartup.addListener(() => { void ready.then(() => refresh(true)); });
+chrome.tabs.onActivated.addListener(() => refresh(true));
+chrome.tabs.onRemoved.addListener(() => refresh(true));
+chrome.tabs.onUpdated.addListener((_id, changes, tab) => {
+  if (tab.active && (changes.status || changes.url || changes.title)) refresh(true);
+});
+chrome.tabs.onZoomChange.addListener(() => refresh());
+chrome.windows.onFocusChanged.addListener(() => refresh(true));
+chrome.windows.onBoundsChanged.addListener(() => refresh(true));
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type === 'context-changed' && sender.id === chrome.runtime.id
+    && sender.frameId === 0 && sender.tab?.active && !sender.tab.incognito
+    && /^https?:\/\//.test(sender.url ?? '')) refresh();
 });

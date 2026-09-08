@@ -25,7 +25,7 @@ func browserObservation(_ message: [String: Any], app: String?) -> [String: Any]
         result["pageUnavailableReason"] = "browser-internal-page"
     }
     if result["pageAvailable"] as? Bool == false {
-        for key in ["viewport", "scroll", "visualViewport", "devicePixelRatio", "pointerAnchor", "pageWindow", "fullscreen"] { result[key] = nil }
+        for key in ["viewport", "scroll", "visualViewport", "devicePixelRatio", "pointerAnchor", "pointerCalibration", "pageWindow", "fullscreen"] { result[key] = nil }
     }
     return result
 }
@@ -683,7 +683,7 @@ final class Bridge {
             for (label, key) in [("Page URL", "url"), ("Page title", "title"), ("Observed at", "observedAt")] {
                 if let value = browser[key] as? String { lines.append("- \(label): \(quoted(String(value.prefix(16_384))))") }
             }
-            for (label, key) in [("Viewport (CSS px)", "viewport"), ("Scroll (CSS px)", "scroll"), ("Browser window", "window"), ("Visual viewport", "visualViewport"), ("Page window", "pageWindow"), ("Pointer calibration", "pointerAnchor")] {
+            for (label, key) in [("Viewport (CSS px)", "viewport"), ("Scroll (CSS px)", "scroll"), ("Browser window", "window"), ("Visual viewport", "visualViewport"), ("Page window", "pageWindow"), ("Pointer calibration", "pointerAnchor"), ("Pointer calibration state", "pointerCalibration")] {
                 if let value = browser[key] as? [String: Any], JSONSerialization.isValidJSONObject(value),
                    let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) {
                     lines.append("- \(label): \(text)")
@@ -1535,13 +1535,14 @@ func selfTest() throws {
                         "pageAvailable": false, "pageUnavailableReason": reason, "url": url, "title": "Observed tab",
                         "viewport": ["width": 999], "scroll": ["y": 999], "devicePixelRatio": 2,
                         "pointerAnchor": ["screen": ["x": 10, "y": 10]],
+                        "pointerCalibration": ["status": "ready"],
                         "pageWindow": ["outerWidth": 1200], "fullscreen": false,
                         "window": ["focused": true, "left": -1200, "top": 40, "width": 1200, "height": 800]])
         let partial = bridge.markdown(bridge.original!)
         assert(partial.contains(quoted(url)) && partial.contains("Observed tab") && partial.contains("-1200"))
         assert(partial.contains("Page measurements: unavailable") && !partial.contains("Viewport (CSS px)"))
         assert(partial.contains("Screenshot source and crop origin: unknown"))
-        assert(bridge.browser?["pointerAnchor"] == nil && bridge.browser?["pageWindow"] == nil && bridge.browser?["fullscreen"] == nil)
+        assert(bridge.browser?["pointerAnchor"] == nil && bridge.browser?["pointerCalibration"] == nil && bridge.browser?["pageWindow"] == nil && bridge.browser?["fullscreen"] == nil)
     }
     for url in ["file:///private/screenshot.png", "javascript:alert(1)", "data:text/html,private", "chrome:extensions"] {
         app = "com.google.Chrome"; putImage(); bridge.tick()
@@ -1549,6 +1550,15 @@ func selfTest() throws {
                         "url": url, "window": ["focused": true]])
         assert(bridge.browser == nil, "Unsupported or malformed browser URL was accepted")
     }
+    app = "com.google.Chrome"; putImage(); bridge.tick()
+    bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
+                    "pageAvailable": true, "url": "https://example.com/", "window": ["focused": true],
+                    "pointerCalibration": ["status": "unfocused-pointer", "enabled": true,
+                                           "visibility": "visible", "focused": true]])
+    let missingCalibrationMD = bridge.markdown(bridge.original!)
+    assert(missingCalibrationMD.contains("- Pointer calibration state:") && missingCalibrationMD.contains("unfocused-pointer"))
+    assert(!missingCalibrationMD.contains("Estimated selection") && !missingCalibrationMD.contains("- Pointer calibration:"),
+           "Missing-calibration diagnostics must not invent an anchor or an estimate")
 
     // Exercise the real bridge with decoded input and a private pasteboard, never a global tap.
     var now: TimeInterval = 1000
@@ -1589,6 +1599,7 @@ func selfTest() throws {
         reply["pageWindow"] = ["screenX": -90, "screenY": -40, "outerWidth": 450, "outerHeight": 350]
         reply["pointerAnchor"] = ["screen": ["x": -70, "y": -15], "client": ["x": 20, "y": 10],
                                   "ageMs": 60_000, "observedAt": iso(bridge.gestureContext!.date.addingTimeInterval(-60))]
+        reply["pointerCalibration"] = ["status": "ready", "enabled": true, "visibility": "visible", "focused": false]
         return reply
     }
     _ = startSelection(replyBeforeEnd: true)
@@ -1683,6 +1694,7 @@ func selfTest() throws {
         assert(bridge.regionContext?.browser?["pointerAnchor"] != nil && md.contains("Observed raw drag extent") && md.contains("source-a"))
         let savedCalibration = bridge.regionContext!.browser!["pointerAnchor"] as! [String: Any]
         assert(md.contains(savedCalibration["observedAt"] as! String) && md.contains("- Pointer calibration:") && md.contains("- Page window:") && md.contains("- fullscreen: false"))
+        assert(md.contains("- Pointer calibration state:") && md.contains("\"status\":\"ready\""))
         if !invalidBeforeCapture {
             assert(md.contains("Retained pointer calibration age at browser observation: 60000.0 ms") && md.contains("Unobserved browser-chrome changes"))
         }

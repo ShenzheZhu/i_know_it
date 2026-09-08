@@ -6,6 +6,8 @@
   let previous;
   let previousTitle;
   let anchor;
+  let calibrationStatus = 'not-observed';
+  function clearAnchor(reason) { anchor = undefined; calibrationStatus = reason; }
   function snapshot() {
     return {
       url: location.href, title: document.title,
@@ -21,24 +23,26 @@
     };
   }
   const geometry = page => JSON.stringify({ ...page, title: undefined });
-  function report(force = false) {
-    if (!enabled || document.visibilityState !== 'visible') { anchor = undefined; return; }
+  function report(force = false, reason = 'geometry-changed') {
+    if (!enabled) { anchor = undefined; return; }
+    if (document.visibilityState !== 'visible') { clearAnchor('hidden'); return; }
     const page = snapshot();
     const current = geometry(page);
     const geometryChanged = force === true || current !== previous;
     if (!geometryChanged && page.title === previousTitle) return;
-    if (geometryChanged) anchor = undefined;
+    if (geometryChanged) clearAnchor(reason);
     previous = current; previousTitle = page.title;
     try { chrome.runtime.sendMessage({ type: 'context-changed', geometryChanged }).catch(() => {}); }
-    catch { enabled = false; anchor = undefined; }
+    catch { enabled = false; clearAnchor('extension-unavailable'); }
   }
-  function invalidate() { anchor = undefined; report(true); }
+  function invalidate(reason = 'geometry-changed') { clearAnchor(reason); report(true, reason); }
   function setEnabled(value) {
     stateRevision++;
+    if (enabled && value === true) { report(); return; }
     enabled = value === true;
-    anchor = undefined;
+    clearAnchor(enabled ? 'awaiting-pointer' : 'disabled');
     previous = undefined;
-    report();
+    report(false, calibrationStatus);
   }
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === 'page-state' && typeof message.enabled === 'boolean'
@@ -62,41 +66,52 @@
     if (!enabled) return;
     report();
     const now = performance.now();
-    if (document.pointerLockElement || document.visibilityState !== 'visible'
-      || !Number.isFinite(now) || (anchor && now < anchor.time)) { anchor = undefined; return; }
-    if (!event.isTrusted || event.pointerType !== 'mouse' || event.buttons !== 0
-      || event.ctrlKey || event.altKey || event.shiftKey || event.metaKey
-      || !document.hasFocus()
-      || ![now, event.timeStamp, event.screenX, event.screenY, event.clientX, event.clientY].every(Number.isFinite)
-      || now - event.timeStamp < 0 || now - event.timeStamp > 100) return;
+    if (document.pointerLockElement) { clearAnchor('pointer-lock'); return; }
+    if (document.visibilityState !== 'visible') { clearAnchor('hidden'); return; }
+    if (!Number.isFinite(now) || (anchor && now < anchor.time)) { clearAnchor('invalid-clock'); return; }
+    if (!event.isTrusted || event.pointerType !== 'mouse') return;
+    const rejected = event.buttons !== 0 || event.ctrlKey || event.altKey || event.shiftKey || event.metaKey
+      ? 'modified-or-pressed-pointer' : !document.hasFocus() ? 'unfocused-pointer'
+        : ![event.timeStamp, event.screenX, event.screenY, event.clientX, event.clientY].every(Number.isFinite)
+          ? 'invalid-pointer-data' : now - event.timeStamp < 0 || now - event.timeStamp > 100
+            ? 'out-of-time-pointer' : undefined;
+    if (rejected) { if (!anchor) calibrationStatus = rejected; return; }
     // ponytail: retain one calibration while its geometry stays unchanged, not a pointer trace.
     anchor = {
       screen: { x: event.screenX, y: event.screenY }, client: { x: event.clientX, y: event.clientY },
       time: event.timeStamp, observedAt: new Date().toISOString(), signature: previous,
     };
+    calibrationStatus = 'ready';
   }, { passive: true });
   // This function lives in Chrome's isolated extension world, not the page's world.
   globalThis.__iKnowItPageContext = () => {
     const page = snapshot();
     const ageMs = anchor ? performance.now() - anchor.time : Infinity;
-    if (anchor && anchor.signature !== geometry(page)) invalidate();
+    if (anchor && anchor.signature !== geometry(page)) invalidate('geometry-mismatch');
     if (enabled && document.visibilityState === 'visible' && !document.pointerLockElement && anchor
       && Number.isFinite(ageMs) && ageMs >= 0) {
       page.pointerAnchor = { screen: anchor.screen, client: anchor.client, ageMs, observedAt: anchor.observedAt };
-    } else { anchor = undefined; }
+    } else if (!enabled) anchor = undefined;
+    else if (document.visibilityState !== 'visible') clearAnchor('hidden');
+    else if (document.pointerLockElement) clearAnchor('pointer-lock');
+    else if (anchor) clearAnchor('invalid-clock');
+    // Keep only the current reason, never an input/event history or rejected coordinates.
+    page.pointerCalibration = {
+      status: calibrationStatus, enabled, visibility: document.visibilityState, focused: document.hasFocus(),
+    };
     return page;
   };
   for (const event of ['scroll', 'resize', 'hashchange', 'popstate']) {
-    addEventListener(event, invalidate, { passive: true });
+    addEventListener(event, () => invalidate(`window-${event}`), { passive: true });
   }
   addEventListener('pageshow', event => { if (event.persisted) readState(); else report(); }, { passive: true });
   document.addEventListener('freeze', () => setEnabled(false));
   document.addEventListener('resume', readState);
   document.addEventListener('visibilitychange', report);
-  document.addEventListener('fullscreenchange', invalidate);
-  document.addEventListener('pointerlockchange', invalidate);
-  visualViewport?.addEventListener('scroll', invalidate, { passive: true });
-  visualViewport?.addEventListener('resize', invalidate, { passive: true });
+  document.addEventListener('fullscreenchange', () => invalidate('fullscreen-change'));
+  document.addEventListener('pointerlockchange', () => invalidate('pointer-lock-change'));
+  visualViewport?.addEventListener('scroll', () => invalidate('viewport-scroll'), { passive: true });
+  visualViewport?.addEventListener('resize', () => invalidate('viewport-resize'), { passive: true });
   // Detect SPA URL/title and window-position changes without replacing page APIs.
   setInterval(report, 1000);
 })();

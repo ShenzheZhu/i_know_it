@@ -711,6 +711,7 @@ vm.runInContext(source, sandbox);
   let pageAcknowledgement;
   await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: true }, { id: chrome.runtime.id }, reply => { pageAcknowledgement = reply; });
   assert.equal(pageAcknowledgement.contextReady, true, 'A current collector explicitly acknowledges trusted page-state synchronization');
+  await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: true }, { id: chrome.runtime.id });
   resolveInitialState({ enabled: false });
   await Promise.resolve();
   assert.equal(contentMessages.length, 1, 'A delayed initial state must not override a newer live toggle');
@@ -769,6 +770,21 @@ vm.runInContext(source, sandbox);
     assert.deepEqual(JSON.parse(JSON.stringify(stationary)), { ...JSON.parse(JSON.stringify(anchor)), ageMs },
       'A stationary calibration retains its original coordinates and timestamp, with its actual age');
   }
+  restorePage(); move();
+  const beforeSameOn = JSON.parse(JSON.stringify(readPage().pointerAnchor));
+  const signalsBeforeSameOn = contentMessages.length;
+  now += 5000;
+  for (let repeat = 0; repeat < 2; repeat++) {
+    await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: true }, { id: chrome.runtime.id });
+    assert.deepEqual(JSON.parse(JSON.stringify(readPage().pointerAnchor)), { ...beforeSameOn, ageMs: 5000 },
+      'Repeated ON synchronization must preserve valid calibration and its original timestamp');
+  }
+  assert.equal(contentMessages.length, signalsBeforeSameOn, 'Repeated ON must not report an unchanged layout as invalidated');
+  page.screenX += 0.25;
+  await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: true }, { id: chrome.runtime.id });
+  assert.equal(readPage().pointerAnchor, undefined, 'Repeated ON must still clear calibration when current geometry differs');
+  page.screenX -= 0.25;
+  interval();
   for (const invalidNow of [999.75, NaN, Infinity, -Infinity]) {
     restorePage(); move(); now = invalidNow;
     assert.equal(readPage().pointerAnchor, undefined, 'An invalid calibration age must not leave the page');
@@ -777,8 +793,19 @@ vm.runInContext(source, sandbox);
   }
   restorePage(); move(); page.focused = false;
   assert(readPage().pointerAnchor, 'Focus loss alone during the system screenshot overlay must retain a stable calibration');
+  assert.deepEqual(JSON.parse(JSON.stringify(readPage().pointerCalibration)), {
+    status: 'ready', enabled: true, visibility: 'visible', focused: false,
+  }, 'Current focus diagnostics must not invalidate an existing anchor');
   move({ screenX: 999, clientX: 500 });
   assert.equal(readPage().pointerAnchor.screen.x, -1179.75, 'An unfocused event cannot replace a valid calibration');
+  assert.equal(readPage().pointerCalibration.status, 'ready');
+  handlers['window:resize'](); move();
+  assert.equal(readPage().pointerAnchor, undefined);
+  assert.equal(readPage().pointerCalibration.status, 'unfocused-pointer', 'A missing first observation records the focus rejection');
+  page.focused = true;
+  assert.equal(readPage().pointerCalibration.status, 'unfocused-pointer', 'Focus restoration alone does not invent a pointer observation');
+  move();
+  assert.equal(readPage().pointerCalibration.status, 'ready', 'A later eligible observation replaces the missing-calibration reason');
   assert.equal(handlers['window:blur'], undefined);
   assert.equal(handlers['window:focus'], undefined);
   restorePage();
@@ -847,6 +874,9 @@ vm.runInContext(source, sandbox);
     const signalsBefore = contentMessages.length;
     handlers[signal]();
     assert.equal(readPage().pointerAnchor, undefined, `${signal} must invalidate even when sampled geometry is unchanged`);
+    assert.notEqual(readPage().pointerCalibration.status, 'ready', 'Invalidation diagnostics must not claim a usable calibration');
+    assert.deepEqual(Object.keys(readPage().pointerCalibration), ['status', 'enabled', 'visibility', 'focused'],
+      'Diagnostics retain only current state, never rejected coordinates or an event history');
     assert.equal(contentMessages.length, signalsBefore + 1, `${signal} must notify pending native selections`);
     assert.equal(contentMessages.at(-1).geometryChanged, true);
     interval();
@@ -858,6 +888,7 @@ vm.runInContext(source, sandbox);
   page.visibility = 'hidden'; handlers['document:visibilitychange']();
   page.visibility = 'visible'; handlers['document:visibilitychange']();
   assert.equal(readPage().pointerAnchor, undefined, 'Hiding and reopening a page must not revive an anchor');
+  assert.equal(readPage().pointerCalibration.status, 'hidden', 'The last clearing reason survives visibility restoration');
 
   for (const sender of [null, {}, { id: 'foreign-extension' }, { id: chrome.runtime.id, tab: { id: 4 } }, { id: chrome.runtime.id, tab: null }]) {
     move();
@@ -866,6 +897,7 @@ vm.runInContext(source, sandbox);
   }
   await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: 'false' }, { id: chrome.runtime.id }, () => assert.fail('Malformed state must not receive an ACK'));
   assert(readPage().pointerAnchor, 'Only a Boolean state may change collection');
+  await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: false }, { id: chrome.runtime.id });
   await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: false }, { id: chrome.runtime.id });
   const offSignals = contentMessages.length;
   page.y++; interval(); move();
@@ -937,6 +969,11 @@ vm.runInContext(source, sandbox);
   contentChrome.runtime.sendMessage = () => { throw new Error('Extension context invalidated'); };
   page.y++;
   assert.doesNotThrow(() => handlers['window:scroll'](), 'An unloaded extension must not throw errors into the page');
+  interval();
+  assert.equal(readPage().pointerAnchor, undefined);
+  assert.equal(readPage().pointerCalibration.status, 'extension-unavailable', 'Polling and reads must preserve the disabling reason');
+  await livePageState(false);
+  assert.equal(readPage().pointerCalibration.status, 'disabled', 'An explicit OFF state replaces the previous failure reason');
   for (const initialState of [true, false, 'unavailable', 'rejected', 'throw']) {
     const startupSignals = [];
     const startupContent = { ...content, addEventListener() {}, setInterval() {}, chrome: { runtime: {

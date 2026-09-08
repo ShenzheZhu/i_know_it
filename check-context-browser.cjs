@@ -165,12 +165,14 @@ const server = http.createServer((_request, response) => {
     assert.equal(initial.url, `${origin}/`);
     assert.equal(initial.viewport.width, 1000);
     assert(initial.pageWindow && typeof initial.fullscreen === 'boolean');
-    await page.waitForTimeout(1250); // Exercise stationary use beyond the former one-second lifetime.
+    await page.waitForTimeout(5100); // Exercise a real stationary pause through periodic reports.
+    await worker.evaluate(async () => { await __contextTest.updatePages(); await __contextTest.updatePages(); });
     const stationary = (await read()).pointerAnchor;
-    assert(stationary && stationary.ageMs > 1000);
+    assert(stationary && stationary.ageMs > 5000, 'Same-ON synchronization must preserve a five-second-old calibration');
     assert.equal(stationary.observedAt, initial.pointerAnchor.observedAt, 'Reading an old calibration must not fabricate a fresh timestamp');
     assert.deepEqual(stationary.screen, initial.pointerAnchor.screen);
     assert.deepEqual(stationary.client, initial.pointerAnchor.client);
+    assert.equal((await read()).pointerCalibration.status, 'ready');
     await page.evaluate(() => dispatchEvent(new PointerEvent('pointermove', {
       pointerType: 'mouse', buttons: 0, clientX: 500, clientY: 500, screenX: 700, screenY: 700,
     })));

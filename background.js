@@ -2,6 +2,14 @@ let enabled = false;
 let port;
 let timer;
 let revision = 0;
+let inputStatus = 'disconnected';
+const state = () => ({ enabled, inputStatus });
+
+function updateInputStatus(status) {
+  if (inputStatus === status) return;
+  inputStatus = status;
+  void chrome.runtime.sendMessage({ type: 'input-status', ...state() }).catch(() => {});
+}
 
 function send(message) {
   try { port?.postMessage(message); } catch { /* Reconnect on the next alarm. */ }
@@ -89,10 +97,15 @@ function connect() {
     port = connection;
     connection.onDisconnect.addListener(() => {
       void chrome.runtime.lastError;
-      if (port === connection) port = undefined;
+      if (port === connection) { port = undefined; updateInputStatus('disconnected'); }
     });
     connection.onMessage.addListener((message) => {
-      if (port !== connection || message?.type !== 'request-context') return;
+      if (port !== connection) return;
+      if (message?.type === 'input-status') {
+        if (['ready', 'permission-required', 'unavailable', 'off'].includes(message.status)) updateInputStatus(message.status);
+        return;
+      }
+      if (message?.type !== 'request-context') return;
       if (typeof message.requestId === 'string' && message.requestId.length <= 128) {
         void readContext(revision, message.requestId);
       } else refresh();
@@ -119,15 +132,16 @@ const ready = chrome.storage.local.get({ enabled: true }).catch(() => ({ enabled
 let changing = ready;
 function setEnabled(value) {
   const operation = changing.then(async () => {
-    if (enabled === value) { connect(); return { enabled }; }
+    if (enabled === value) { connect(); return state(); }
     enabled = value;
+    inputStatus = enabled ? 'disconnected' : 'off';
     revision++;
     clearTimeout(timer);
     send({ type: 'enabled', enabled });
     await Promise.all([chrome.storage.local.set({ enabled }).catch(() => {}), updateButton()]);
     connect();
     if (enabled) refresh(true);
-    return { enabled };
+    return state();
   });
   changing = operation.catch(() => {});
   return operation;
@@ -149,11 +163,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'context-changed' && sender?.id === chrome.runtime.id
     && sender.frameId === 0 && sender.tab?.active && !sender.tab.incognito
     && /^https?:\/\//.test(sender.url ?? '')) refresh();
-  if ((message?.type !== 'get-state' && message?.type !== 'set-enabled')
+  if (!['get-state', 'set-enabled', 'request-input-access'].includes(message?.type)
     || sender?.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('popup.html')
     || sender.tab !== undefined || (message.type === 'set-enabled' && typeof message.enabled !== 'boolean')) return;
-  const operation = message.type === 'get-state'
-    ? changing.then(() => ({ enabled })) : setEnabled(message.enabled);
-  void operation.then(sendResponse, () => sendResponse({ enabled })).catch(() => {});
+  const operation = message.type === 'set-enabled' ? setEnabled(message.enabled) : changing.then(() => {
+    if (message.type === 'request-input-access' && enabled && inputStatus === 'permission-required') {
+      send({ type: 'request-input-access' });
+    }
+    return state();
+  });
+  void operation.then(sendResponse, () => sendResponse(state())).catch(() => {});
   return true;
 });

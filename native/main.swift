@@ -13,6 +13,23 @@ func quoted(_ value: String) -> String {
 }
 func iso(_ date: Date) -> String { ISO8601DateFormatter().string(from: date) }
 
+func browserObservation(_ message: [String: Any], app: String?) -> [String: Any]? {
+    guard message["available"] as? Bool == true, browserApps.contains(app ?? ""),
+          let window = message["window"] as? [String: Any], window["focused"] as? Bool == true,
+          let url = message["url"] as? String, url.count <= 16_384,
+          let parsed = URL(string: url), ["http", "https", "chrome"].contains(parsed.scheme ?? ""),
+          let host = parsed.host, !host.isEmpty else { return nil }
+    var result = message
+    if parsed.scheme == "chrome" {
+        result["pageAvailable"] = false
+        result["pageUnavailableReason"] = "browser-internal-page"
+    }
+    if result["pageAvailable"] as? Bool == false {
+        for key in ["viewport", "scroll", "visualViewport", "devicePixelRatio"] { result[key] = nil }
+    }
+    return result
+}
+
 struct ClipboardImage {
     let items: [[NSPasteboard.PasteboardType: Data]]
     let png: Data
@@ -76,6 +93,183 @@ struct ClipboardImage {
     }
 }
 
+struct RegionDisplay: Equatable {
+    let id: CGDirectDisplayID
+    let bounds: CGRect
+    let scale: CGFloat
+}
+
+struct RegionObservation {
+    let startedAt: TimeInterval
+    let completedAt: TimeInterval
+    let display: RegionDisplay
+    let globalRect: CGRect
+    let displayPixelRect: CGRect
+}
+
+// Correlates an observed plain selection with a fresh clipboard image. This is
+// not a receipt from macOS and cannot establish the image's source/provenance.
+struct RegionGestureTracker {
+    private struct Selection {
+        let startedAt: TimeInterval
+        let clipboardCount: Int
+        let displays: [RegionDisplay]
+        var lastAt: TimeInterval
+        var remainingShortcutModifiers: CGEventFlags = [.maskShift, .maskCommand]
+        var keyReleased = false
+        var start: CGPoint?
+        var observation: RegionObservation?
+    }
+    private var selection: Selection?
+    var isArmed: Bool { selection != nil }
+    var isSelecting: Bool { selection != nil && selection?.observation == nil }
+    var startedAt: TimeInterval? { selection?.startedAt }
+
+    mutating func reset() { selection = nil }
+
+    private static let modifiers: CGEventFlags = [
+        .maskShift, .maskControl, .maskAlternate, .maskCommand,
+        .maskSecondaryFn, .maskNumericPad, .maskHelp
+    ]
+    private static let shortcut: CGEventFlags = [.maskControl, .maskShift, .maskCommand]
+
+    private static func integral(_ value: CGFloat) -> Bool {
+        value.isFinite && value.rounded(.towardZero) == value
+    }
+
+    private static func valid(_ displays: [RegionDisplay]) -> Bool {
+        !displays.isEmpty && Set(displays.map(\.id)).count == displays.count && displays.allSatisfy {
+            $0.id != 0 && $0.scale.isFinite && $0.scale > 0 &&
+            $0.bounds.width > 0 && $0.bounds.height > 0 &&
+            [$0.bounds.minX, $0.bounds.minY, $0.bounds.width, $0.bounds.height,
+             $0.bounds.maxX, $0.bounds.maxY].allSatisfy(integral)
+        }
+    }
+
+    private func current(now: TimeInterval, displays: [RegionDisplay]) -> Bool {
+        guard let selection, now.isFinite, now >= selection.lastAt,
+              selection.displays == displays.sorted(by: { $0.id < $1.id }) else { return false }
+        if let result = selection.observation {
+            return now >= result.completedAt && now - result.completedAt <= 2
+        }
+        return now - selection.startedAt <= 60
+    }
+
+    // Returns true only when a new shortcut arms. Freeze companion context then.
+    @discardableResult
+    mutating func observe(type: CGEventType, flags: CGEventFlags,
+                          keycode: Int = 0, isRepeat: Bool = false,
+                          location: CGPoint = .zero, clipboardCount: Int,
+                          displays: [RegionDisplay], now: TimeInterval) -> Bool {
+        let modifiers = flags.intersection(Self.modifiers)
+        if isArmed && !current(now: now, displays: displays) { reset() }
+        let wasArmed = isArmed
+        if type == .keyDown && keycode == 21 {
+            defer { if wasArmed { reset() } }
+            guard !wasArmed, !isRepeat, modifiers == Self.shortcut,
+                  now.isFinite, now >= 0, clipboardCount >= 0, clipboardCount < Int.max,
+                  Self.valid(displays) else { return false }
+            selection = Selection(startedAt: now, clipboardCount: clipboardCount,
+                                  displays: displays.sorted(by: { $0.id < $1.id }), lastAt: now)
+            return true
+        }
+        guard var state = selection else { return false }
+        guard clipboardCount == state.clipboardCount ||
+                (state.observation != nil && clipboardCount == state.clipboardCount + 1) else {
+            reset(); return false
+        }
+        // Caps Lock and event-delivery flags do not affect the native selection.
+        let other = modifiers.subtracting(.maskControl)
+        if state.start == nil {
+            guard other.subtracting(state.remainingShortcutModifiers).isEmpty else {
+                reset(); return false
+            }
+            state.remainingShortcutModifiers.formIntersection(other)
+        } else if !other.isEmpty {
+            reset(); return false
+        }
+        switch type {
+        case .flagsChanged, .mouseMoved:
+            break
+        case .keyUp where keycode == 21 && !state.keyReleased:
+            state.keyReleased = true
+        case .leftMouseDown:
+            guard state.start == nil, other.isEmpty,
+                  Self.integral(location.x), Self.integral(location.y) else {
+                reset(); return false
+            }
+            state.start = location
+        case .leftMouseDragged:
+            guard state.start != nil, state.observation == nil,
+                  Self.integral(location.x), Self.integral(location.y) else {
+                reset(); return false
+            }
+        case .leftMouseUp:
+            guard let start = state.start, state.observation == nil,
+                  Self.integral(location.x), Self.integral(location.y) else {
+                reset(); return false
+            }
+            let rect = CGRect(x: min(start.x, location.x), y: min(start.y, location.y),
+                              width: abs(location.x - start.x), height: abs(location.y - start.y))
+            let candidates = state.displays.filter {
+                rect.minX >= $0.bounds.minX && rect.minY >= $0.bounds.minY &&
+                rect.maxX <= $0.bounds.maxX && rect.maxY <= $0.bounds.maxY
+            }
+            guard rect.width > 0, rect.height > 0, candidates.count == 1 else {
+                reset(); return false
+            }
+            let display = candidates[0]
+            let pixels = CGRect(x: (rect.minX - display.bounds.minX) * display.scale,
+                                y: (rect.minY - display.bounds.minY) * display.scale,
+                                width: rect.width * display.scale, height: rect.height * display.scale)
+            guard [pixels.minX, pixels.minY, pixels.width, pixels.height,
+                   pixels.maxX, pixels.maxY].allSatisfy(Self.integral),
+                  pixels.width < CGFloat(Int.max), pixels.height < CGFloat(Int.max) else {
+                reset(); return false
+            }
+            state.observation = RegionObservation(startedAt: state.startedAt, completedAt: now,
+                                                  display: display, globalRect: rect, displayPixelRect: pixels)
+        default:
+            reset(); return false
+        }
+        state.lastAt = now
+        selection = state
+        return false
+    }
+
+    // Call only when an image is available. A clipboard clear and its image fill
+    // may share one changeCount; do not consume the selection for an empty read.
+    mutating func consume(width: Int, height: Int, clipboardCount: Int,
+                          displays: [RegionDisplay], now: TimeInterval) -> RegionObservation? {
+        guard current(now: now, displays: displays), let state = selection else {
+            reset(); return nil
+        }
+        if clipboardCount == state.clipboardCount { return nil }
+        defer { reset() }
+        guard clipboardCount == state.clipboardCount + 1,
+              let result = state.observation,
+              width > 0, height > 0,
+              CGFloat(width) == result.displayPixelRect.width,
+              CGFloat(height) == result.displayPixelRect.height else { return nil }
+        return result
+    }
+}
+
+func currentRegionDisplays() -> [RegionDisplay] {
+    NSScreen.screens.compactMap { screen in
+        guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+        return RegionDisplay(id: id.uint32Value, bounds: CGDisplayBounds(id.uint32Value), scale: screen.backingScaleFactor)
+    }.sorted { $0.id < $1.id }
+}
+
+struct GestureContext {
+    let id: String
+    let app: String?
+    let date: Date
+    let time: TimeInterval
+    var browser: [String: Any]?
+}
+
 final class Bridge {
     let board: NSPasteboard
     let directory: URL
@@ -91,6 +285,13 @@ final class Bridge {
     var requestID: String?
     var browser: [String: Any]?
     var files: [URL]?
+    var enabledChanged: (Bool) -> Void = { _ in }
+    var displays: () -> [RegionDisplay] = currentRegionDisplays
+    var clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    var gesture = RegionGestureTracker()
+    var gestureContext: GestureContext?
+    var region: RegionObservation?
+    var regionContext: GestureContext?
 
     init(board: NSPasteboard, directory: URL, currentApp: @escaping () -> String?, request: @escaping (String) -> Void) {
         self.board = board; self.directory = directory; self.currentApp = currentApp; self.request = request
@@ -99,8 +300,24 @@ final class Bridge {
     func setEnabled(_ value: Bool) {
         guard value != enabled else { return }
         enabled = value
-        if !value { restore(); original = nil; files = nil; browser = nil; requestID = nil }
+        if !value {
+            restore(); original = nil; files = nil; browser = nil; requestID = nil
+            cancelGesture(); region = nil; regionContext = nil
+        }
         seen = board.changeCount
+        enabledChanged(value)
+    }
+    func cancelGesture() { gesture.reset(); gestureContext = nil }
+    func observeGesture(type: CGEventType, flags: CGEventFlags, keycode: Int64 = 0,
+                        isRepeat: Bool = false, location: CGPoint = .zero) {
+        guard enabled else { cancelGesture(); return }
+        let now = clock()
+        if gesture.observe(type: type, flags: flags, keycode: Int(keycode), isRepeat: isRepeat,
+                           location: location, clipboardCount: board.changeCount, displays: displays(), now: now) {
+            let context = GestureContext(id: UUID().uuidString, app: currentApp(), date: Date(), time: now)
+            gestureContext = context
+            if browserApps.contains(context.app ?? "") { request(context.id) }
+        } else if !gesture.isArmed { gestureContext = nil }
     }
     func restore() {
         if ownsClipboard(), let original { original.restore(board) }
@@ -119,21 +336,18 @@ final class Bridge {
     func receive(_ message: [String: Any]) {
         if message["type"] as? String == "enabled", let value = message["enabled"] as? Bool { setEnabled(value); return }
         guard enabled, message["type"] as? String == "browser-context",
-              let id = message["requestId"] as? String, id == requestID else { return }
+              let id = message["requestId"] as? String else { return }
+        if let context = gestureContext, id == context.id {
+            // A slow reply belongs to a later scene, so never promote it to shortcut context.
+            if gesture.isSelecting && clock() - context.time <= 1 {
+                gestureContext?.browser = browserObservation(message, app: context.app)
+            }
+            return
+        }
+        guard id == requestID else { return }
         guard board.changeCount == seen else { tick(); return }
-        if message["available"] as? Bool == true, browserApps.contains(observedApp ?? ""),
-           let window = message["window"] as? [String: Any], window["focused"] as? Bool == true,
-           let url = message["url"] as? String, url.count <= 16_384,
-           let parsed = URL(string: url), ["http", "https", "chrome"].contains(parsed.scheme ?? ""),
-           let host = parsed.host, !host.isEmpty {
-            browser = message
-            if parsed.scheme == "chrome" {
-                browser?["pageAvailable"] = false
-                browser?["pageUnavailableReason"] = "browser-internal-page"
-            }
-            if browser?["pageAvailable"] as? Bool == false {
-                for key in ["viewport", "scroll", "visualViewport", "devicePixelRatio"] { browser?[key] = nil }
-            }
+        if let context = browserObservation(message, app: observedApp) {
+            browser = context
             // Do not delay paste for the browser; update a prepared context file when its reply arrives.
             if let md = files?.last, let image = original { try? writeMarkdown(image, to: md) }
         }
@@ -149,8 +363,25 @@ final class Bridge {
             "- Foreground app observed at that time: \(quoted(observedApp ?? "unknown"))",
             "- Screenshot source and crop origin: unknown. Foreground observations do not prove where an image was captured."
         ]
+        if let region, let context = regionContext {
+            func rect(_ r: CGRect) -> String { "x=\(r.minX), y=\(r.minY), width=\(r.width), height=\(r.height)" }
+            lines += ["", "## Observed screenshot selection (correlated, not verified)",
+                "- Shortcut: Control + Shift + Command + 4",
+                "- Shortcut observed at: \(iso(context.date))",
+                "- Foreground app at shortcut: \(quoted(context.app ?? "unknown"))",
+                "- Selection in global display points: \(rect(region.globalRect))",
+                "- Coordinate system: primary display top-left origin; x right, y down; other displays can have negative origins.",
+                "- Display ID: \(region.display.id)",
+                "- Display bounds in global points: \(rect(region.display.bounds))",
+                "- Display backing scale: \(region.display.scale)",
+                "- Selection in this display's image pixels: \(rect(region.displayPixelRect))",
+                "- Match: one clipboard change within 2 seconds of mouse-up, with identical image dimensions.",
+                "- Evidence limit: this is an observed drag matched by time and size, not a macOS capture receipt. It does not verify the source app, page, or crop origin.",
+                "- Web-page CSS coordinates: unknown; browser chrome, side panels, and zoom prevent deriving them from window bounds.",
+                "- Re-observe the live display before clicking; its layout may have changed."]
+        }
         if let browser {
-            lines += ["", "## Browser tab observed after the clipboard changed"]
+            lines += ["", region == nil ? "## Browser tab observed after the clipboard changed" : "## Browser context requested at the screenshot shortcut"]
             for (label, key) in [("Page URL", "url"), ("Page title", "title"), ("Observed at", "observedAt")] {
                 if let value = browser[key] as? String { lines.append("- \(label): \(quoted(String(value.prefix(16_384))))") }
             }
@@ -181,12 +412,16 @@ final class Bridge {
         if count != seen {
             // An external copy always replaces our pending work; never restore over a newer copy.
             owned = nil; ownershipToken = nil; original = nil; files = nil; browser = nil; requestID = nil
+            region = nil; regionContext = nil
             // Clearing and filling a pasteboard can share one change count. Wait for its contents.
             guard let entries = board.pasteboardItems, !entries.isEmpty else { return }
             seen = count
-            guard let image = ClipboardImage(board), board.changeCount == count else { return }
+            guard let image = ClipboardImage(board), board.changeCount == count else { cancelGesture(); return }
             original = image; observedAt = Date(); observedApp = currentApp()
-            if browserApps.contains(observedApp ?? "") {
+            region = gesture.consume(width: image.width, height: image.height, clipboardCount: count, displays: displays(), now: clock())
+            if region != nil { regionContext = gestureContext; browser = gestureContext?.browser }
+            cancelGesture()
+            if region == nil && browserApps.contains(observedApp ?? "") {
                 let id = UUID().uuidString; requestID = id; request(id)
             }
         }
@@ -247,7 +482,287 @@ func readMessage(from input: FileHandle = .standardInput) -> [String: Any]? {
     return value
 }
 
+// A listen-only tap observes the existing system shortcut; it never posts or changes input.
+final class RegionInputMonitor {
+    let bridge: Bridge
+    let preflight: () -> Bool
+    let requestPermission: () -> Bool
+    let statusChanged: (String) -> Void
+    var tap: CFMachPort?
+    var source: CFRunLoopSource?
+    var status = ""
+    var checkedAt: TimeInterval = 0
+
+    init(bridge: Bridge, preflight: @escaping () -> Bool,
+         requestPermission: @escaping () -> Bool = { CGRequestListenEventAccess() },
+         statusChanged: @escaping (String) -> Void = { try? send(["type": "input-status", "status": $0]) }) {
+        self.bridge = bridge; self.preflight = preflight
+        self.requestPermission = requestPermission; self.statusChanged = statusChanged
+    }
+    func report(_ value: String) {
+        guard status != value else { return }
+        status = value
+        statusChanged(value)
+    }
+    func stop() {
+        if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+        if let tap { CFMachPortInvalidate(tap) }
+        source = nil; tap = nil
+        bridge.cancelGesture()
+    }
+    func update() {
+        guard bridge.enabled else { stop(); report("off"); return }
+        // Creating an unauthorized tap can itself prompt. Never do so from startup or polling.
+        guard preflight() else { stop(); report("permission-required"); return }
+        guard tap == nil else { return }
+        let types: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp,
+                                    .leftMouseDragged, .mouseMoved, .rightMouseDown, .rightMouseUp,
+                                    .otherMouseDown, .otherMouseUp, .scrollWheel]
+        let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+        guard let created = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                    options: .listenOnly, eventsOfInterest: mask, callback: { _, type, event, data in
+                        if let data {
+                            Unmanaged<RegionInputMonitor>.fromOpaque(data).takeUnretainedValue().handle(type, event)
+                        }
+                        return Unmanaged.passUnretained(event)
+                    }, userInfo: Unmanaged.passUnretained(self).toOpaque()),
+              let runSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, created, 0) else {
+            report("unavailable"); return
+        }
+        tap = created; source = runSource
+        CFRunLoopAddSource(CFRunLoopGetMain(), runSource, .commonModes)
+        CGEvent.tapEnable(tap: created, enable: true)
+        report("ready")
+    }
+    func poll() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - checkedAt >= 1 else { return }
+        checkedAt = now
+        update()
+    }
+    func requestAccess() {
+        guard bridge.enabled else { return }
+        // Reached only after an explicit click in the extension's authenticated popup.
+        _ = requestPermission()
+        update()
+    }
+    func handle(_ type: CGEventType, _ event: CGEvent) {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            stop(); report("unavailable"); return
+        }
+        guard bridge.enabled else { return }
+        // Ignore ordinary keyboard/pointer activity immediately; never retain its text or history.
+        guard bridge.gesture.isArmed || (type == .keyDown && event.getIntegerValueField(.keyboardEventKeycode) == 21) else { return }
+        bridge.observeGesture(type: type, flags: event.flags,
+            keycode: event.getIntegerValueField(.keyboardEventKeycode),
+            isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0, location: event.location)
+    }
+}
+
+func regionSelfTest() {
+    let primary = RegionDisplay(id: 1, bounds: CGRect(x: 0, y: 0, width: 1440, height: 900), scale: 2)
+    let secondary = RegionDisplay(id: 2, bounds: CGRect(x: -1920, y: -200, width: 1920, height: 1080), scale: 1)
+    let displays = [primary, secondary]
+    let chord: CGEventFlags = [.maskControl, .maskShift, .maskCommand]
+    var checks = 0
+    func check(_ value: @autoclosure () -> Bool, _ message: String) {
+        checks += 1
+        if !value() { fatalError("FAIL: \(message)") }
+    }
+    func armed(flags: CGEventFlags = chord, repeatKey: Bool = false,
+               screens: [RegionDisplay] = displays, count: Int = 40) -> RegionGestureTracker {
+        var tracker = RegionGestureTracker()
+        tracker.observe(type: .keyDown, flags: flags, keycode: 21, isRepeat: repeatKey,
+                        clipboardCount: count, displays: screens, now: 100)
+        return tracker
+    }
+    func event(_ tracker: inout RegionGestureTracker, _ type: CGEventType,
+               _ x: CGFloat = 0, _ y: CGFloat = 0, flags: CGEventFlags = [],
+               key: Int = 0, time: TimeInterval = 101, count: Int = 40,
+               screens: [RegionDisplay] = displays) {
+        tracker.observe(type: type, flags: flags, keycode: key,
+                        location: CGPoint(x: x, y: y), clipboardCount: count,
+                        displays: screens, now: time)
+    }
+    func completed(start: CGPoint = CGPoint(x: 100, y: 200),
+                   end: CGPoint = CGPoint(x: 400, y: 450),
+                   flags: CGEventFlags = [], screens: [RegionDisplay] = displays,
+                   endTime: TimeInterval = 101.5) -> RegionGestureTracker {
+        var tracker = armed(screens: screens)
+        event(&tracker, .flagsChanged, flags: [], screens: screens)
+        event(&tracker, .leftMouseDown, start.x, start.y, flags: flags, screens: screens)
+        event(&tracker, .leftMouseDragged, end.x, end.y, flags: flags, time: endTime, screens: screens)
+        event(&tracker, .leftMouseUp, end.x, end.y, flags: flags, time: endTime, screens: screens)
+        return tracker
+    }
+    func consume(_ tracker: inout RegionGestureTracker, width: Int = 600, height: Int = 500,
+                 count: Int = 41, time: TimeInterval = 102,
+                 screens: [RegionDisplay] = displays) -> RegionObservation? {
+        tracker.consume(width: width, height: height, clipboardCount: count,
+                        displays: screens, now: time)
+    }
+
+    var tracker = completed()
+    let retina = consume(&tracker)
+    check(retina?.globalRect == CGRect(x: 100, y: 200, width: 300, height: 250), "normal region global points")
+    check(retina?.displayPixelRect == CGRect(x: 200, y: 400, width: 600, height: 500), "Retina display pixels")
+    check(retina?.startedAt == 100 && retina?.completedAt == 101.5, "observation times")
+    check(retina?.display == primary, "display identity")
+    check(!tracker.isArmed && consume(&tracker) == nil, "consume once")
+
+    for reversed in [false, true] {
+        let a = CGPoint(x: -1800, y: -100), b = CGPoint(x: -1500, y: 150)
+        tracker = completed(start: reversed ? b : a, end: reversed ? a : b)
+        let result = consume(&tracker, width: 300, height: 250)
+        check(result?.globalRect == CGRect(x: -1800, y: -100, width: 300, height: 250), "negative origin and reverse drag")
+        check(result?.displayPixelRect == CGRect(x: 120, y: 100, width: 300, height: 250), "secondary screen local pixels")
+    }
+    tracker = completed(start: CGPoint(x: 1440, y: 900), end: CGPoint(x: 0, y: 0))
+    check(consume(&tracker, width: 2880, height: 1800) != nil, "exact screen bounds")
+    tracker = completed(flags: .maskControl)
+    check(consume(&tracker) != nil, "Control held optional")
+    tracker = completed()
+    event(&tracker, .flagsChanged, time: 101.6)
+    event(&tracker, .mouseMoved, 500, 500, time: 101.7)
+    check(consume(&tracker) != nil, "post-selection modifier release and movement")
+
+    check(armed(flags: chord.union(.maskAlphaShift)).isArmed, "Caps Lock harmless")
+    for flag in [CGEventFlags.maskAlternate, .maskSecondaryFn, .maskNumericPad, .maskHelp] {
+        check(!armed(flags: chord.union(flag)).isArmed, "extra modifier rejects shortcut")
+    }
+    for flag in [CGEventFlags.maskControl, .maskShift, .maskCommand] {
+        check(!armed(flags: chord.subtracting(flag)).isArmed, "missing modifier rejects shortcut")
+    }
+    check(!armed(repeatKey: true).isArmed, "repeat key ignored")
+    check(!armed(count: -1).isArmed && !armed(count: Int.max).isArmed, "invalid counter rejects shortcut")
+    tracker = RegionGestureTracker()
+    check(!tracker.observe(type: .keyDown, flags: chord, keycode: 22, clipboardCount: 40, displays: displays, now: 100), "exact physical key only")
+    tracker = armed()
+    check(tracker.startedAt == 100, "stable arm time")
+    check(!tracker.observe(type: .keyDown, flags: chord, keycode: 21, clipboardCount: 40, displays: displays, now: 101), "duplicate shortcut does not rearm")
+    check(!tracker.isArmed, "duplicate shortcut cancels uncertainty")
+    tracker = armed()
+    check(tracker.observe(type: .keyDown, flags: chord, keycode: 21, clipboardCount: 40, displays: displays, now: 161), "expired gesture allows next shortcut")
+    check(tracker.startedAt == 161, "new shortcut replaces expired arm time")
+
+    for type in [CGEventType.rightMouseDown, .otherMouseDown, .scrollWheel, .tapDisabledByTimeout, .tapDisabledByUserInput] {
+        tracker = armed()
+        event(&tracker, type)
+        check(!tracker.isArmed, "unexpected input resets")
+    }
+    for key in [49, 53, 0, 123] { // Space, Escape, A, left arrow.
+        tracker = armed()
+        event(&tracker, .keyDown, key: key)
+        check(!tracker.isArmed, "window mode and other keys reset")
+    }
+    tracker = armed()
+    event(&tracker, .keyUp, key: 21)
+    event(&tracker, .keyUp, key: 21)
+    check(!tracker.isArmed, "duplicate key release resets")
+    for flag in [CGEventFlags.maskShift, .maskCommand, .maskAlternate, .maskSecondaryFn] {
+        tracker = armed()
+        event(&tracker, .leftMouseDown, 100, 200, flags: flag)
+        check(!tracker.isArmed, "nonplain mouse-down resets")
+        tracker = armed()
+        event(&tracker, .leftMouseDown, 100, 200)
+        event(&tracker, .flagsChanged, flags: flag, time: 101.2)
+        check(!tracker.isArmed, "modifier added during drag resets")
+    }
+    tracker = armed()
+    event(&tracker, .flagsChanged, flags: [.maskShift, .maskControl])
+    event(&tracker, .flagsChanged, flags: .maskControl, time: 101.1)
+    event(&tracker, .leftMouseDown, 100, 200, flags: .maskControl, time: 101.2)
+    event(&tracker, .flagsChanged, flags: [], time: 101.3)
+    event(&tracker, .leftMouseUp, 400, 450, time: 101.5)
+    check(consume(&tracker) != nil, "initial modifiers and Control may release naturally")
+    tracker = armed()
+    event(&tracker, .flagsChanged)
+    event(&tracker, .flagsChanged, flags: .maskShift, time: 101.1)
+    check(!tracker.isArmed, "released Shift cannot return")
+
+    for type in [CGEventType.leftMouseUp, .leftMouseDragged] {
+        tracker = armed()
+        event(&tracker, type, 400, 450)
+        check(!tracker.isArmed, "missing mouse-down")
+    }
+    tracker = armed()
+    event(&tracker, .leftMouseDown, 100, 200)
+    check(consume(&tracker) == nil && !tracker.isArmed, "clipboard image before mouse-up cancels")
+    tracker = armed()
+    event(&tracker, .leftMouseDown, 100, 200)
+    event(&tracker, .leftMouseDown, 100, 200, time: 101.1)
+    check(!tracker.isArmed, "duplicate mouse-down")
+    tracker = completed()
+    event(&tracker, .leftMouseUp, 400, 450, time: 101.6)
+    check(!tracker.isArmed, "duplicate mouse-up")
+
+    tracker = completed()
+    check(consume(&tracker, count: 40) == nil && tracker.isArmed, "old clipboard image cannot consume selection")
+    check(consume(&tracker, count: 41) != nil, "single clear/fill counter becomes eligible when image arrives")
+    tracker = armed()
+    event(&tracker, .leftMouseDown, 100, 200, count: 41)
+    check(!tracker.isArmed, "clipboard change before selection cancels")
+    tracker = armed()
+    event(&tracker, .leftMouseDown, 100, 200)
+    event(&tracker, .leftMouseUp, 400, 450, time: 101.5, count: 41)
+    check(!tracker.isArmed, "clipboard change before completion cancels")
+    tracker = completed()
+    event(&tracker, .mouseMoved, 500, 500, time: 101.7, count: 41)
+    check(consume(&tracker) != nil, "empty clear observed after completion can fill at same count")
+    tracker = completed()
+    event(&tracker, .mouseMoved, 500, 500, time: 101.7, count: 42)
+    check(!tracker.isArmed, "multiple clipboard changes while waiting cancel")
+    for count in [39, 42, 400] {
+        tracker = completed()
+        check(consume(&tracker, count: count) == nil && !tracker.isArmed, "counter reversal/jump rejects")
+    }
+    for size in [(599, 500), (600, 499), (0, 500), (600, 0), (-1, 500), (1200, 1000)] {
+        tracker = completed()
+        check(consume(&tracker, width: size.0, height: size.1) == nil && !tracker.isArmed, "exact image dimensions required")
+    }
+    tracker = completed()
+    check(consume(&tracker, time: 103.5) != nil, "inclusive result timeout")
+    tracker = completed()
+    check(consume(&tracker, time: 103.5001) == nil && !tracker.isArmed, "expired result")
+    tracker = completed(endTime: 160)
+    check(consume(&tracker, time: 162) != nil, "full selection timeout plus two seconds for clipboard")
+    tracker = completed(endTime: 160.001)
+    check(!tracker.isArmed, "expired selection")
+    tracker = armed()
+    event(&tracker, .leftMouseDown, 100, 200, time: 101)
+    event(&tracker, .leftMouseUp, 400, 450, time: 100.9)
+    check(!tracker.isArmed, "out-of-order event time")
+    tracker = completed()
+    check(consume(&tracker, time: .nan) == nil, "nonfinite time")
+
+    let changed = [RegionDisplay(id: 1, bounds: primary.bounds, scale: 1), secondary]
+    tracker = completed()
+    check(consume(&tracker, screens: changed) == nil, "scale/topology changes at clipboard read")
+    tracker = armed()
+    event(&tracker, .leftMouseDown, 100, 200, screens: changed)
+    check(!tracker.isArmed, "topology changes during gesture")
+    tracker = completed()
+    check(consume(&tracker, screens: Array(displays.reversed())) != nil, "display enumeration order irrelevant")
+    tracker = completed(start: CGPoint(x: -100, y: 100), end: CGPoint(x: 100, y: 200))
+    check(!tracker.isArmed, "cross-screen region rejected")
+    tracker = completed(start: CGPoint(x: 100, y: 100), end: CGPoint(x: 100, y: 200))
+    check(!tracker.isArmed, "zero area rejected")
+    tracker = completed(screens: [primary, RegionDisplay(id: 2, bounds: primary.bounds, scale: 2)])
+    check(!tracker.isArmed, "overlapping mirrored displays ambiguous")
+    for x in [CGFloat.nan, .infinity, 100.5] {
+        tracker = completed(start: CGPoint(x: x, y: 200))
+        check(!tracker.isArmed, "nonfinite/fractional points rejected")
+    }
+    for screens in [[], [primary, primary], [RegionDisplay(id: 1, bounds: primary.bounds, scale: .nan)],
+                    [RegionDisplay(id: 0, bounds: primary.bounds, scale: 1)],
+                    [RegionDisplay(id: 1, bounds: CGRect(x: 0.5, y: 0, width: 100, height: 100), scale: 1)]] {
+        check(!armed(screens: screens).isArmed, "invalid display set")
+    }
+    print("PASS: \(checks) passive region state checks; no event tap, UI, screenshot, or clipboard access")
+}
+
 func selfTest() throws {
+    regionSelfTest()
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     let board = NSPasteboard(name: NSPasteboard.Name("com.iknowit.test.\(UUID().uuidString)"))
     defer { board.releaseGlobally(); try? FileManager.default.removeItem(at: directory) }
@@ -426,6 +941,81 @@ func selfTest() throws {
         assert(bridge.browser == nil, "Unsupported or malformed browser URL was accepted")
     }
 
+    // Exercise the real bridge with decoded input and a private pasteboard, never a global tap.
+    var now: TimeInterval = 1000
+    bridge.clock = { now }
+    bridge.displays = { [RegionDisplay(id: 7, bounds: CGRect(x: -100, y: -50, width: 500, height: 400), scale: 1)] }
+    func startSelection(replyBeforeEnd: Bool = false) -> String {
+        bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
+        now += 10
+        bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
+        assert(bridge.gesture.isArmed && bridge.gestureContext?.app == app)
+        let id = requested
+        if replyBeforeEnd { bridge.receive(selectionReply(id)) }
+        bridge.observeGesture(type: .flagsChanged, flags: [])
+        bridge.observeGesture(type: .leftMouseDown, flags: [], location: CGPoint(x: -80, y: -20))
+        now += 0.2
+        bridge.observeGesture(type: .leftMouseUp, flags: [], location: CGPoint(x: -76, y: -17))
+        return id
+    }
+    func selectionReply(_ id: String, url: String = "https://example.com/source-a") -> [String: Any] {
+        ["type": "browser-context", "requestId": id, "available": true, "url": url,
+         "observedAt": iso(Date()), "window": ["focused": true]]
+    }
+    _ = startSelection(replyBeforeEnd: true)
+    // Clear and delayed fill have one change count. The later foreground app is not the source.
+    board.clearContents(); bridge.tick(); app = "com.apple.TextEdit"
+    board.setData(png, forType: .png); bridge.tick()
+    assert(bridge.region?.globalRect == CGRect(x: -80, y: -20, width: 4, height: 3))
+    assert(bridge.region?.displayPixelRect == CGRect(x: 20, y: 30, width: 4, height: 3))
+    assert(bridge.regionContext?.app == "com.google.Chrome" && bridge.observedApp == app && bridge.requestID == nil)
+    app = "com.openai.codex"; bridge.tick()
+    let selectionMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
+    assert(selectionMD.contains("source-a") && selectionMD.contains("correlated, not verified") && selectionMD.contains("x=-80.0"))
+    assert(selectionMD.contains("requested at the screenshot shortcut") && !selectionMD.contains("## Browser tab observed after"))
+    let regionPNG = try Data(contentsOf: bridge.files![0]); assert(regionPNG == png)
+    // A post-copy reply cannot overwrite the request made at the shortcut.
+    bridge.receive(selectionReply("unrelated", url: "https://example.com/later-b"))
+    assert(bridge.browser?["url"] as? String == "https://example.com/source-a")
+    bridge.setEnabled(false)
+    assert(board.data(forType: .png) == png && bridge.region == nil && !bridge.gesture.isArmed)
+
+    let lateID = startSelection()
+    putImage(); app = "com.openai.codex"; bridge.tick()
+    assert(bridge.region != nil && bridge.browser == nil)
+    bridge.receive(selectionReply(lateID))
+    assert(bridge.browser == nil, "Post-selection replies must not become screenshot context")
+    let lateRegionMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
+    assert(!lateRegionMD.contains("source-a"))
+    board.clearContents(); board.setString("new copy", forType: .string)
+    bridge.receive(selectionReply(lateID, url: "https://example.com/too-late"))
+    bridge.tick()
+    assert(board.string(forType: .string) == "new copy" && bridge.region == nil)
+
+    let slowID = startSelection()
+    now += 1.1
+    bridge.receive(selectionReply(slowID, url: "https://example.com/too-late"))
+    putImage(); bridge.tick()
+    assert(bridge.region != nil && bridge.browser == nil, "Delayed page B must not become shortcut context")
+    _ = startSelection()
+    bridge.observeGesture(type: .keyDown, flags: [], keycode: 49)
+    putImage(); bridge.tick()
+    assert(bridge.region == nil && bridge.requestID != nil, "Window/move mode cannot produce guessed geometry")
+    bridge.setEnabled(false)
+
+    var permissionRequests = 0, inputStates: [String] = []
+    let monitor = RegionInputMonitor(bridge: bridge, preflight: { false },
+        requestPermission: { permissionRequests += 1; return false }, statusChanged: { inputStates.append($0) })
+    monitor.update(); monitor.requestAccess()
+    assert(permissionRequests == 0 && monitor.status == "off")
+    bridge.setEnabled(true); monitor.update(); monitor.poll()
+    assert(permissionRequests == 0 && monitor.tap == nil && monitor.status == "permission-required")
+    monitor.requestAccess()
+    assert(permissionRequests == 1 && monitor.tap == nil)
+    bridge.setEnabled(false); monitor.update()
+    assert(inputStates == ["off", "permission-required", "off"])
+    print("PASS: shortcut-time context, delayed clipboard fill, coordinate attachment, late/stale replies, OFF, and explicit-only permission requests.")
+
     bitmap.setColor(NSColor(deviceRed: 1, green: 0, blue: 0, alpha: 1), atX: 0, y: 0)
     let variants = [png, bitmap.representation(using: .png, properties: [:])!]
     var random: UInt64 = 0x494B49
@@ -500,18 +1090,23 @@ let bridge = Bridge(board: .general, directory: support.appendingPathComponent("
 }, request: {
     do { try send(["type": "request-context", "requestId": $0]) } catch { shutdown() }
 })
-func shutdown() { bridge.restore(); exit(0) }
+let inputMonitor = RegionInputMonitor(bridge: bridge, preflight: { CGPreflightListenEventAccess() })
+bridge.enabledChanged = { _ in inputMonitor.update() }
+func shutdown() { inputMonitor.stop(); bridge.restore(); exit(0) }
 // ponytail: restore on normal shutdown; SIGKILL and crashes cannot run cleanup without a persistent recovery journal.
 let signalSources = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
     signal(number, SIG_IGN)
     let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
     source.setEventHandler { shutdown() }; source.resume(); return source
 }
-let timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in bridge.tick() }
+let timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in bridge.tick(); inputMonitor.poll() }
 let observer = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in bridge.tick() }
 Thread.detachNewThread {
     while let value = readMessage() {
-        DispatchQueue.main.async { bridge.receive(value) }
+        DispatchQueue.main.async {
+            if value["type"] as? String == "request-input-access" { inputMonitor.requestAccess() }
+            else { bridge.receive(value) }
+        }
     }
     DispatchQueue.main.async { shutdown() }
 }

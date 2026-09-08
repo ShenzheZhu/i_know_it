@@ -11,6 +11,7 @@ fs.mkdirSync(output, { recursive: true });
 const original = fs.readFileSync(path.join(__dirname, 'native/main.swift'), 'utf8');
 let source = original;
 for (const [before, after] of [
+  ['preflight: { CGPreflightListenEventAccess() }', 'preflight: { false }'],
   [/^let support = .*$/m, 'let support = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)'],
   ['Bridge(board: .general, directory: support', 'Bridge(board: NSPasteboard(name: NSPasteboard.Name(CommandLine.arguments[3])), directory: support'],
   ['NSWorkspace.shared.frontmostApplication?.bundleIdentifier', '(try? String(contentsOfFile: CommandLine.arguments[4], encoding: .utf8))'],

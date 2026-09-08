@@ -6,6 +6,7 @@ const source = fs.readFileSync(path.join(__dirname, 'background.js'), 'utf8');
 const pause = () => new Promise(resolve => setTimeout(resolve, 90));
 function event() { return { listeners: [], addListener(fn) { this.listeners.push(fn); }, async emit(...args) { await Promise.all(this.listeners.map(fn => fn(...args))); } }; }
 const messages = [];
+const broadcasts = [];
 const titles = [];
 let settings = { enabled: true };
 let saveSettings = async (value) => { settings = value; };
@@ -15,7 +16,7 @@ let reads = 0;
 const connections = [];
 let connection;
 const chrome = {
-  runtime: { id: 'extension-id', getURL(file) { return `chrome-extension://extension-id/${file}`; }, connectNative(name) {
+  runtime: { id: 'extension-id', getURL(file) { return `chrome-extension://extension-id/${file}`; }, async sendMessage(message) { broadcasts.push(message); }, connectNative(name) {
     assert.equal(name, 'com.iknowit.bridge');
     connection = { closed: false, messages: [], postMessage(message) {
       if (this.closed) throw new Error('Disconnected port');
@@ -54,6 +55,7 @@ vm.runInContext(source, sandbox);
   assert.equal(titles.at(-1), 'I Know It! — On');
   assert.equal(chrome.action.onClicked.listeners.length, 0, 'Toolbar clicks must not toggle the popup state');
   assert.equal((await popup({ type: 'get-state' })).enabled, true);
+  assert.equal((await popup({ type: 'get-state' })).inputStatus, 'disconnected');
   const controlBaseline = messages.length;
   assert.equal((await popup({ type: 'set-enabled', enabled: true })).enabled, true);
   for (const sender of [
@@ -64,11 +66,33 @@ vm.runInContext(source, sandbox);
   ]) {
     assert.equal(await popup({ type: 'get-state' }, sender), undefined);
     assert.equal(await popup({ type: 'set-enabled', enabled: false }, sender), undefined);
+    assert.equal(await popup({ type: 'request-input-access' }, sender), undefined);
   }
   for (const message of [null, {}, { type: 'toggle' }, { type: 'set-enabled' },
     { type: 'set-enabled', enabled: 'false' }, { type: 'set-enabled', enabled: null },
     { type: 'set-enabled', enabled: 0 }]) assert.equal(await popup(message), undefined);
   assert.equal(messages.length, controlBaseline, 'Duplicate state and rejected messages must not affect the host');
+  await popup({ type: 'request-input-access' });
+  assert.equal(messages.length, controlBaseline, 'A disconnected companion must not receive permission requests');
+  for (const status of ['ready', 'unavailable', 'off']) {
+    await connection.onMessage.emit({ type: 'input-status', status });
+    assert.equal((await popup({ type: 'get-state' })).inputStatus, status);
+    assert.equal(broadcasts.at(-1).inputStatus, status);
+    await popup({ type: 'request-input-access' });
+    assert.equal(messages.length, controlBaseline, `${status} must not request permission`);
+  }
+  await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
+  await connection.onMessage.emit({ type: 'input-status', status: 'forged' });
+  assert.equal((await popup({ type: 'get-state' })).inputStatus, 'permission-required');
+  assert.equal(messages.filter(message => message.type === 'request-input-access').length, 0,
+    'Startup, popup reads, state toggles and status messages must never request permission');
+  for (const sender of [{ ...popupSender, tab: { id: 4 } }, { ...popupSender, url: 'https://example.com/' }]) {
+    assert.equal(await popup({ type: 'request-input-access' }, sender), undefined);
+  }
+  assert.equal(messages.length, controlBaseline, 'Forged callers cannot request permission even when required');
+  await popup({ type: 'request-input-access' });
+  assert.equal(messages.at(-1).type, 'request-input-access');
+  assert.equal(messages.filter(message => message.type === 'request-input-access').length, 1);
   assert.equal((await popup({ type: 'get-state' })).enabled, true);
   await connection.onMessage.emit({ type: 'request-context', requestId: 'request-1' });
   await pause();
@@ -78,6 +102,9 @@ vm.runInContext(source, sandbox);
   assert.equal(settings.enabled, false);
   assert.equal(titles.at(-1), 'I Know It! — Off');
   assert.equal(messages.at(-1).enabled, false);
+  await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
+  await popup({ type: 'request-input-access' });
+  assert.equal(messages.filter(message => message.type === 'request-input-access').length, 1, 'OFF must suppress permission requests');
   const disabledReads = reads;
   await connection.onMessage.emit({ type: 'request-context', requestId: 'off' });
   await pause();
@@ -135,8 +162,11 @@ vm.runInContext(source, sandbox);
   await connection.onMessage.emit({ type: 'request-context', requestId: 'old-host' });
   await pause();
   const previousConnection = connection;
+  await previousConnection.onMessage.emit({ type: 'input-status', status: 'ready' });
   previousConnection.closed = true;
   await previousConnection.onDisconnect.emit();
+  assert.equal((await popup({ type: 'get-state' })).inputStatus, 'disconnected');
+  assert.equal(broadcasts.at(-1).inputStatus, 'disconnected');
   const connectionCount = connections.length;
   await chrome.alarms.onAlarm.emit({ name: 'unrelated' });
   assert.equal(connections.length, connectionCount);
@@ -152,6 +182,8 @@ vm.runInContext(source, sandbox);
   assert.equal(connection.messages.at(-1).available, true);
   const readsBeforeOldMessage = reads;
   await previousConnection.onMessage.emit({ type: 'request-context', requestId: 'late-old-port' });
+  await previousConnection.onMessage.emit({ type: 'input-status', status: 'ready' });
+  assert.equal((await popup({ type: 'get-state' })).inputStatus, 'disconnected', 'Old host status must not mark a new connection ready');
   await pause();
   assert.equal(reads, readsBeforeOldMessage, 'Discard late messages from a disconnected host');
   await previousConnection.onDisconnect.emit();
@@ -463,5 +495,5 @@ vm.runInContext(source, sandbox);
   contentChrome.runtime.sendMessage = () => { throw new Error('Extension context invalidated'); };
   page.y++;
   assert.doesNotThrow(() => handlers['window:scroll'](), 'An unloaded extension must not throw errors into the page');
-  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
+  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; status validation and disconnect reset; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

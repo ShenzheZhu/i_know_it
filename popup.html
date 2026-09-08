@@ -7,7 +7,9 @@
   <style>
     :root { color-scheme: light dark; --bg: #f6f8f4; --card: #fff; --ink: #19291f; --muted: #5e7064; --line: #dce4dc; --accent: #286449; --off: #718679; --thumb: #fff; --error: #9b362a; }
     * { box-sizing: border-box; }
-    body { width: 320px; max-width: 100vw; margin: 0; padding: 22px; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    /* The popup measures content before choosing a viewport; viewport units can shrink it. */
+    html { width: 320px; }
+    body { margin: 0; padding: 22px; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     h1 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -.6px; }
     .intro { margin: 5px 0 20px; color: var(--muted); font-size: 13px; }
     .control { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); cursor: pointer; }

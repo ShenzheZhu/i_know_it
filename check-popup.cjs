@@ -96,10 +96,42 @@ const server = http.createServer((req, res) => {
     await page.locator('body').screenshot({ path: path.join(output, 'popup-dark.png') });
     const reduced = await page.locator('.track').evaluate(el => getComputedStyle(el, '::after').transitionDuration);
     assert.equal(reduced, '0s');
-    await page.setViewportSize({ width: 280, height: 420 });
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    // Popup sizing starts at 25 px, unlike an ordinary tab with a pre-sized viewport.
+    const layouts = [];
+    for (const deviceScaleFactor of [1, 2]) {
+      const sized = await browser.newContext({ viewport: { width: 25, height: 25 }, deviceScaleFactor });
+      await sized.exposeFunction('fixtureMessage', dispatch);
+      await sized.addInitScript(() => { globalThis.chrome = { runtime: { sendMessage: message => window.fixtureMessage(message) } }; });
+      const popup = await sized.newPage();
+      for (const colorScheme of ['light', 'dark']) {
+        await popup.emulateMedia({ colorScheme, reducedMotion: 'reduce' });
+        for (const initialWidth of [25, 181, 280, 320]) {
+          await popup.setViewportSize({ width: initialWidth, height: 25 });
+          await popup.goto(url);
+          await popup.waitForFunction(() => !document.querySelector('#enabled').disabled);
+          // Feed preferred content size back into the viewport, as the popup host does.
+          for (let step = 0; step < 2; step++) {
+            const size = await popup.evaluate(() => ({ width: Math.min(800, Math.max(25, document.documentElement.scrollWidth)), height: Math.min(600, Math.max(25, document.body.scrollHeight)) }));
+            await popup.setViewportSize(size);
+          }
+          const bounds = await popup.evaluate(() => {
+            const rect = selector => { const { x, y, width, height, right, bottom } = document.querySelector(selector).getBoundingClientRect(); return { x, y, width, height, right, bottom }; };
+            return { viewport: innerWidth, body: rect('body'), card: rect('.control'), track: rect('.track'), input: rect('#enabled'), text: rect('#switch-title'), overflow: document.documentElement.scrollWidth > innerWidth };
+          });
+          const label = JSON.stringify({ deviceScaleFactor, colorScheme, initialWidth });
+          await popup.screenshot({ path: path.join(output, `popup-sized-${deviceScaleFactor}-${colorScheme}-${initialWidth}.png`) });
+          assert.equal(bounds.viewport, 320, `Popup intrinsic width: ${label}`);
+          assert.equal(bounds.body.width, 320, label);
+          assert(!bounds.overflow, label);
+          assert(bounds.track.right <= bounds.card.right - 16 && bounds.track.x >= bounds.text.right + 16, `Switch stays inside card without overlapping text: ${label}`);
+          assert.deepEqual(bounds.input, bounds.track, `Visible switch and click target align: ${label}`);
+          layouts.push({ deviceScaleFactor, colorScheme, initialWidth, width: bounds.viewport });
+        }
+      }
+      await sized.close();
+    }
     assert.deepEqual(errors, []);
-    const report = { checkedAt: new Date().toISOString(), checks: ['Popup opens without changing state', 'Mouse and keyboard switch update background, native host messages and badge', 'Reopening restores state', 'Pending requests disable duplicate input', 'Lost reply reads back actual state', 'Disconnected states stay disabled and recover on reopen', 'Light/dark layout, reduced motion, narrow width and no script errors'], scope: 'Real popup DOM and background code with fixture Chrome APIs; no extension-manager or Codex UI control' };
+    const report = { checkedAt: new Date().toISOString(), checks: ['Popup opens without changing state', 'Mouse and keyboard switch update background, native host messages and badge', 'Reopening restores state', 'Pending requests disable duplicate input', 'Lost reply reads back actual state', 'Disconnected states stay disabled and recover on reopen', 'Light/dark layout, reduced motion and no script errors', 'Popup preferred-size feedback at 25/181/280/320 px, DPR 1/2, card containment and aligned click target'], layouts, scope: 'Real popup DOM and background code with fixture Chrome APIs and simulated popup sizing feedback; no extension-manager or Codex UI control' };
     fs.writeFileSync(path.join(output, 'results.json'), JSON.stringify(report, null, 2) + '\n');
     console.log(JSON.stringify(report, null, 2));
   } finally { await browser.close(); server.close(); }

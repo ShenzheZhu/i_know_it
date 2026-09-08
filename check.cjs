@@ -840,9 +840,44 @@ vm.runInContext(source, sandbox);
   restorePage(); move({ timeStamp: 900 });
   assert.equal(readPage().pointerAnchor.ageMs, 100, 'A pointer event at the freshness boundary is accepted');
 
+  for (const observe of [() => handlers['window:scroll'](), interval, readPage]) {
+    restorePage(); move();
+    const beforeScroll = JSON.parse(JSON.stringify(readPage().pointerAnchor));
+    const originalScroll = { x: page.x, y: page.y };
+    for (const next of [{ x: -15.25, y: 1000.5 }, originalScroll]) {
+      const signalsBefore = contentMessages.length;
+      page.x = next.x; page.y = next.y; now += 5000;
+      observe();
+      const scrolled = readPage();
+      assert.deepEqual(JSON.parse(JSON.stringify(scrolled.scroll)), next);
+      assert.deepEqual(JSON.parse(JSON.stringify(scrolled.pointerAnchor)), { ...beforeScroll, ageMs: now - 1000 },
+        'Plain document scroll and scrollback must retain original calibration coordinates/time with their actual age');
+      assert.equal(scrolled.pointerCalibration.status, 'ready');
+      assert.equal(contentMessages.length, signalsBefore + 1, 'Scroll must notify even when first observed by the getter');
+      assert.equal(contentMessages.at(-1).geometryChanged, true, 'Scroll must invalidate pending native document coordinates');
+    }
+  }
+  restorePage(); move();
+  const beforeEqualScroll = JSON.parse(JSON.stringify(readPage().pointerAnchor));
+  const equalScrollSignals = contentMessages.length;
+  now += 1000; handlers['window:scroll']();
+  assert.deepEqual(JSON.parse(JSON.stringify(readPage().pointerAnchor)), { ...beforeEqualScroll, ageMs: 1000 },
+    'An equal-value document scroll signal preserves calibration');
+  assert.equal(contentMessages.length, equalScrollSignals + 1);
+  assert.equal(contentMessages.at(-1).geometryChanged, true, 'An equal-value scroll still invalidates pending native snapshots');
+  for (const key of ['width', 'height', 'screenX', 'screenY', 'outerWidth', 'outerHeight', 'ratio', 'scale', 'offsetLeft', 'offsetTop']) {
+    restorePage(); move();
+    const old = page[key];
+    page.y += 1; page[key] += 1;
+    handlers['window:scroll']();
+    assert.equal(readPage().pointerAnchor, undefined, `${key} changes accompanying scroll must still clear calibration`);
+    page.y -= 1; page[key] = old;
+    handlers['window:scroll']();
+    assert.equal(readPage().pointerAnchor, undefined, 'Scrollback must not revive a calibration cleared by an origin change');
+  }
+  restorePage();
   for (const [key, next, eventName] of [
-    ['width', 900, 'window:resize'], ['height', 600, 'window:resize'], ['x', -15.25, 'window:scroll'],
-    ['y', 1000.5, 'window:scroll'], ['ratio', 1.25, 'window:resize'],
+    ['width', 900, 'window:resize'], ['height', 600, 'window:resize'], ['ratio', 1.25, 'window:resize'],
     ['scale', 1.25, 'viewport:resize'], ['offsetLeft', 12.5, 'viewport:scroll'], ['offsetTop', 7.25, 'viewport:scroll'],
     ['screenX', -1024.5, null], ['screenY', 100.25, null], ['outerWidth', 1000, 'window:resize'],
     ['outerHeight', 780, 'window:resize'], ['fullscreen', true, 'document:fullscreenchange'],
@@ -868,7 +903,7 @@ vm.runInContext(source, sandbox);
     page[key] = previousValue;
     assert.equal(readPage().pointerAnchor, undefined, 'Getter mismatch followed by restoration without events must not resurrect a calibration');
   }
-  for (const signal of ['window:resize', 'viewport:resize', 'window:scroll', 'viewport:scroll',
+  for (const signal of ['window:resize', 'viewport:resize', 'viewport:scroll',
     'window:hashchange', 'window:popstate', 'document:fullscreenchange', 'document:pointerlockchange']) {
     move(); assert(readPage().pointerAnchor);
     const signalsBefore = contentMessages.length;
@@ -901,7 +936,7 @@ vm.runInContext(source, sandbox);
   await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: false }, { id: chrome.runtime.id });
   const offSignals = contentMessages.length;
   page.y++; interval(); move();
-  handlers['window:resize'](); handlers['viewport:scroll']();
+  handlers['window:scroll'](); handlers['window:resize'](); handlers['viewport:scroll']();
   assert.equal(readPage().pointerAnchor, undefined, 'OFF must clear and stop collecting pointer observations');
   assert.equal(readPage().pointerCalibration.status, 'disabled', 'OFF must not record later structural events');
   assert.equal(contentMessages.length, offSignals, 'OFF must stop metadata change signals');
@@ -994,5 +1029,5 @@ vm.runInContext(source, sandbox);
     assert.equal(startupSignals.length, initialState === true ? 1 : 0,
       'Only an authoritative initial ON reply may enable page reporting');
   }
-  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; authoritative page state and failed-storage toggle propagation; immediate existing-page recovery only after missing ACK, current URL/privacy guards, injection-failure fallback, OFF-during-injection isolation and duplicate-collector prevention; trusted/fractional calibration preserved while stationary with original timestamps; ineligible-event seed rejection without replacing valid calibration; invalid-age, hidden, pointer-lock, OFF and geometry clearing without resurrection; equal-size structural signals invalidate pending native estimates; metadata-only signals without DOM writes; geometry invalidation on different Chrome windows without same-window focus cancellation; authoritative BFCache/resume state, freeze clearing and stale-reply isolation; forged/iframe messages rejected.');
+  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; authoritative page state and failed-storage toggle propagation; immediate existing-page recovery only after missing ACK, current URL/privacy guards, injection-failure fallback, OFF-during-injection isolation and duplicate-collector prevention; trusted/fractional calibration preserved while stationary and across document scroll/scrollback with original timestamps; ineligible-event seed rejection without replacing valid calibration; invalid-age, hidden, pointer-lock, OFF and geometry clearing without resurrection; equal-size structural signals invalidate pending native estimates; metadata-only signals without DOM writes; geometry invalidation on different Chrome windows without same-window focus cancellation; authoritative BFCache/resume state, freeze clearing and stale-reply isolation; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

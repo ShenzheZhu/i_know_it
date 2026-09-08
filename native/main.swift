@@ -351,7 +351,7 @@ struct PageRegionEstimate {
     let origin: CGPoint
     let viewportRect: CGRect
     let documentRect: CGRect
-    let anchorAgeMs: CGFloat
+    let anchorAgeMs: CGFloat?
 }
 
 func estimatePageRegion(_ region: RegionObservation, context: GestureContext) -> PageRegionEstimate? {
@@ -374,15 +374,8 @@ func estimatePageRegion(_ region: RegionObservation, context: GestureContext) ->
           boolean(browser["fullscreen"], equals: false),
           let url = browser["url"] as? String, let parsed = URL(string: url),
           ["https", "http"].contains(parsed.scheme ?? ""), parsed.host?.isEmpty == false,
-          let anchor = browser["pointerAnchor"] as? [String: Any],
-          let screen = anchor["screen"] as? [String: Any], let client = anchor["client"] as? [String: Any],
-          let screenX = number(screen, "x"), let screenY = number(screen, "y"),
-          let clientX = number(client, "x"), let clientY = number(client, "y"),
-          let age = number(anchor, "ageMs"), age >= 0,
-          let stamp = anchor["observedAt"] as? String, stamp.count <= 64,
           let viewport = browser["viewport"] as? [String: Any],
           let width = number(viewport, "width"), let height = number(viewport, "height"), width > 0, height > 0,
-          (0...width).contains(clientX), (0...height).contains(clientY),
           let scroll = browser["scroll"] as? [String: Any],
           let scrollX = number(scroll, "x"), let scrollY = number(scroll, "y"),
           let visual = browser["visualViewport"] as? [String: Any],
@@ -392,7 +385,7 @@ func estimatePageRegion(_ region: RegionObservation, context: GestureContext) ->
           region.display.scale.isFinite, region.display.scale > 0,
           abs(dpr - region.display.scale * zoom) <= 0.01,
           let window = browser["window"] as? [String: Any], boolean(window["focused"], equals: true),
-          let state = window["state"] as? String, ["normal", "maximized"].contains(state),
+          let state = window["state"] as? String, ["normal", "maximized", "fullscreen"].contains(state),
           let left = number(window, "left"), let top = number(window, "top"),
           let outerWidth = number(window, "width"), let outerHeight = number(window, "height"),
           let pageWindow = browser["pageWindow"] as? [String: Any],
@@ -403,13 +396,39 @@ func estimatePageRegion(_ region: RegionObservation, context: GestureContext) ->
           abs(pageWidth - outerWidth) <= 1, abs(pageHeight - outerHeight) <= 1 else { return nil }
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    let date = formatter.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp)
-    // A retained calibration keeps its original timestamp and real monotonic age.
-    // Their sum must still agree with the shortcut-time reply, accepted within one second.
-    guard let date, abs(date.timeIntervalSince(context.date) + Double(age) / 1000) <= 2 else { return nil }
     let windowRect = CGRect(x: left, y: top, width: outerWidth, height: outerHeight)
-    let origin = CGPoint(x: screenX - clientX * zoom, y: screenY - clientY * zoom)
-    let contentRect = CGRect(x: origin.x, y: origin.y, width: width * zoom, height: height * zoom)
+    let origin: CGPoint, contentRect: CGRect, age: CGFloat?
+    if browser["pointerAnchor"] != nil {
+        // A supplied but invalid calibration must never silently choose another origin.
+        guard let anchor = browser["pointerAnchor"] as? [String: Any],
+              let screen = anchor["screen"] as? [String: Any], let client = anchor["client"] as? [String: Any],
+              let screenX = number(screen, "x"), let screenY = number(screen, "y"),
+              let clientX = number(client, "x"), let clientY = number(client, "y"),
+              (0...width).contains(clientX), (0...height).contains(clientY),
+              let anchorAge = number(anchor, "ageMs"), anchorAge >= 0,
+              let stamp = anchor["observedAt"] as? String, stamp.count <= 64,
+              let date = formatter.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp),
+              abs(date.timeIntervalSince(context.date) + Double(anchorAge) / 1000) <= 2 else { return nil }
+        age = anchorAge
+        origin = CGPoint(x: screenX - clientX * zoom, y: screenY - clientY * zoom)
+        contentRect = CGRect(x: origin.x, y: origin.y, width: width * zoom, height: height * zoom)
+    } else {
+        // ponytail: an exact-fit fullscreen viewport only; smaller viewports still need a pointer calibration.
+        guard state == "fullscreen", valid(windowRect),
+              let calibration = browser["pointerCalibration"] as? [String: Any],
+              boolean(calibration["enabled"], equals: true), boolean(calibration["focused"], equals: true),
+              calibration["visibility"] as? String == "visible",
+              let status = calibration["status"] as? String, status != "pointer-lock",
+              let stamp = browser["observedAt"] as? String, stamp.count <= 64,
+              let date = formatter.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp),
+              abs(date.timeIntervalSince(context.date)) <= 2,
+              abs(width * zoom - outerWidth) <= 1, abs(height * zoom - outerHeight) <= 1 else { return nil }
+        age = nil
+        origin = windowRect.origin
+        // Integer CSS viewport sizes can round at fractional zoom. Use only the visible overlap;
+        // this does not enlarge crop or display bounds to cover a mismatched viewport.
+        contentRect = CGRect(x: left, y: top, width: width * zoom, height: height * zoom).intersection(windowRect)
+    }
     // Real Chrome PointerEvent client coordinates have Float32 precision: fractional
     // zoom produced sub-0.001-point edge drift. Larger display/crop overflows stay unknown.
     let edgeEpsilon: CGFloat = 0.001
@@ -663,15 +682,20 @@ final class Bridge {
                 lines += [
                     "- Estimated content viewport origin in global display points: x=\(estimate.origin.x), y=\(estimate.origin.y)",
                     "- Estimated selection in viewport CSS pixels: \(rect(estimate.viewportRect))",
-                    "- Estimated selection in top-document CSS pixels: \(rect(estimate.documentRect))",
-                    "- Retained pointer calibration age at browser observation: \(estimate.anchorAgeMs) ms.",
-                    "- Estimation: retained pointer screen/client calibration with unchanged observed geometry and browser zoom. Unobserved browser-chrome changes may invalidate this estimate. Coordinates may be fractional; window agreement allows up to 1 display point of rounding. This estimates the raw drag, not the exact image crop, verified page provenance, or iframe-local coordinates."
+                    "- Estimated selection in top-document CSS pixels: \(rect(estimate.documentRect))"
                 ]
+                if let age = estimate.anchorAgeMs {
+                    lines += ["- Retained pointer calibration age at browser observation: \(age) ms.",
+                              "- Estimation: retained pointer screen/client calibration with unchanged viewport-origin geometry and browser zoom. Unobserved browser-chrome changes may invalidate this estimate. Window agreement allows up to 1 display point of rounding."]
+                } else {
+                    lines.append("- Estimation: matching fullscreen browser/page-window bounds and scaled viewport dimensions (up to 1 display point of size rounding). The visible overlap supplies the viewport origin and bounds; no pointer calibration was required.")
+                }
+                lines.append("- CSS precision: fractional estimates of the raw drag, not the exact image crop, verified page provenance, or iframe-local coordinates.")
             } else {
                 lines.append(context.geometryInvalidated
                     ? "- Web-page CSS coordinates: unknown; browser geometry changed after the screenshot shortcut."
                     : context.browser?["pointerAnchor"] == nil
-                        ? "- Web-page CSS coordinates: unknown; no usable pointer calibration was supplied."
+                        ? "- Web-page CSS coordinates: unknown; no usable pointer calibration or matching fullscreen geometry was supplied. See the browser measurements below."
                         : "- Web-page CSS coordinates: unknown; the supplied calibration failed time, window, zoom, or containment checks. See the browser measurements below.")
             }
             lines.append("- Re-observe the live display before clicking; its layout may have changed.")
@@ -1290,7 +1314,9 @@ func regionSelfTest() {
         check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "observedAt"], value)) == nil,
               "malformed or age-inconsistent anchor timestamps rejected")
     }
-    for (path, value): ([String], Any) in [(["fullscreen"], true), (["window", "state"], "fullscreen"),
+    check(estimatePageRegion(pageRegion(), context: alteredPage(["window", "state"], "fullscreen"))?.origin == CGPoint(x: 140, y: 220),
+          "fullscreen accepts a valid pointer calibration without assuming toolbar height")
+    for (path, value): ([String], Any) in [(["fullscreen"], true),
         (["visualViewport", "scale"], 1.01), (["visualViewport", "offsetLeft"], 0.1), (["visualViewport", "offsetTop"], -0.1),
         (["devicePixelRatio"], 2.52), (["pointerAnchor", "client", "x"], -0.1),
         (["pointerAnchor", "client", "y"], 321), (["pageWindow", "screenX"], 101.01),
@@ -1324,6 +1350,64 @@ func regionSelfTest() {
     let negativeEstimate = estimatePageRegion(pageRegion(CGRect(x: -1580, y: 120, width: 200, height: 100), display: negativeDisplay),
                                               context: negativePage)
     check(negativeEstimate?.viewportRect == CGRect(x: 160, y: 80, width: 160, height: 80), "negative-origin secondary display mapping")
+    // Real fullscreen window dimensions from receipt 8A56FFE2; no pointer movement is required.
+    func fullscreenPage(zoom: CGFloat = 1) -> GestureContext {
+        var context = pageContext(zoom: zoom)
+        context.browser?["pointerAnchor"] = nil
+        context.browser?["observedAt"] = iso(pageDate)
+        context.browser?["pointerCalibration"] = ["enabled": true, "focused": true, "visibility": "visible", "status": "window-scroll"]
+        context.browser?["viewport"] = ["width": 1470 / zoom, "height": 835 / zoom]
+        context.browser?["window"] = ["focused": true, "state": "fullscreen", "left": 0, "top": 121, "width": 1470, "height": 835]
+        context.browser?["pageWindow"] = ["screenX": 0, "screenY": 121, "outerWidth": 1470, "outerHeight": 835]
+        return context
+    }
+    let fullscreenDisplay = RegionDisplay(id: 1, bounds: CGRect(x: 0, y: 0, width: 1470, height: 956), scale: 2)
+    let fullscreenDrag = pageRegion(CGRect(x: 9.85546875, y: 231.16796875, width: 463.6796875, height: 235.0546875), display: fullscreenDisplay)
+    for zoom: CGFloat in [0.25, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 2, 5] {
+        let estimate = estimatePageRegion(fullscreenDrag, context: fullscreenPage(zoom: zoom))
+        check(estimate?.origin == CGPoint(x: 0, y: 121), "matching fullscreen viewport gives an origin without a pointer")
+        check(estimate != nil && estimate?.anchorAgeMs == nil, "fullscreen bounds mapping does not fabricate a pointer or age")
+        check(estimate?.viewportRect == CGRect(x: 9.85546875 / zoom, y: 110.16796875 / zoom,
+                                               width: 463.6796875 / zoom, height: 235.0546875 / zoom), "fullscreen CSS mapping across zoom")
+        check(estimate?.documentRect == estimate?.viewportRect.offsetBy(dx: 17.25, dy: 500.5), "fullscreen mapping adds current document scroll")
+    }
+    for (path, value): ([String], Any?) in [(["viewport", "width"], 1468), (["viewport", "width"], 1472),
+        (["viewport", "height"], 833), (["viewport", "height"], 837),
+        (["window", "state"], "normal"), (["window", "state"], "maximized"), (["window", "state"], "minimized"),
+        (["pageWindow", "screenY"], 119), (["pageWindow", "outerWidth"], 1468),
+        (["observedAt"], nil), (["observedAt"], "invalid"), (["observedAt"], iso(pageDate.addingTimeInterval(-3))),
+        (["pointerCalibration"], nil), (["pointerCalibration", "enabled"], false), (["pointerCalibration", "enabled"], 1),
+        (["pointerCalibration", "focused"], false), (["pointerCalibration", "visibility"], "hidden"),
+        (["pointerCalibration", "status"], "pointer-lock"), (["pointerCalibration", "status"], nil),
+        (["fullscreen"], true), (["visualViewport", "scale"], 1.1), (["devicePixelRatio"], 1.5),
+        (["pointerAnchor"], NSNull()), (["pointerAnchor"], [:]), (["pointerAnchor"], "invalid")] {
+        var context = fullscreenPage()
+        context.browser = replacing(context.browser!, path, value)
+        check(estimatePageRegion(fullscreenDrag, context: context) == nil, "fullscreen rejects missing, unsafe or mismatched evidence: \(path)")
+    }
+    for anchor in [pageContext().browser!["pointerAnchor"]!, replacing(pageContext().browser!["pointerAnchor"] as! [String: Any], ["ageMs"], -1)] {
+        var context = fullscreenPage(); context.browser?["pointerAnchor"] = anchor
+        check(estimatePageRegion(fullscreenDrag, context: context) == nil, "contradictory or invalid existing pointer data cannot choose the fullscreen fallback")
+    }
+    var fullscreenInvalidated = fullscreenPage(); fullscreenInvalidated.geometryInvalidated = true
+    check(estimatePageRegion(fullscreenDrag, context: fullscreenInvalidated) == nil, "fullscreen cannot reuse geometry changed during selection")
+    for delta: CGFloat in [-0.999, 0.999, -1.001, 1.001] {
+        var context = fullscreenPage(zoom: 1.1)
+        context.browser?["viewport"] = ["width": (1470 + delta) / 1.1, "height": (835 + delta) / 1.1]
+        check((estimatePageRegion(fullscreenDrag, context: context) != nil) == (abs(delta) < 1), "fullscreen size tolerance covers only one point of CSS rounding")
+    }
+    for rect in [CGRect(x: -0.01, y: 231, width: 100, height: 100), CGRect(x: 20, y: 120.99, width: 100, height: 100),
+                 CGRect(x: 1400, y: 231, width: 100, height: 100), CGRect(x: 20, y: 900, width: 100, height: 100)] {
+        check(estimatePageRegion(pageRegion(rect, display: fullscreenDisplay), context: fullscreenPage()) == nil,
+              "fullscreen window or display overflows still fail without widened crop tolerance")
+    }
+    var negativeFullscreen = fullscreenPage()
+    negativeFullscreen.browser = replacing(negativeFullscreen.browser!, ["window", "left"], -1920)
+    negativeFullscreen.browser = replacing(negativeFullscreen.browser!, ["pageWindow", "screenX"], -1920)
+    let negativeFullscreenDisplay = RegionDisplay(id: 2, bounds: CGRect(x: -1920, y: 0, width: 1920, height: 1080), scale: 2)
+    check(estimatePageRegion(pageRegion(CGRect(x: -1880, y: 251, width: 400, height: 200), display: negativeFullscreenDisplay),
+                             context: negativeFullscreen)?.viewportRect == CGRect(x: 40, y: 130, width: 400, height: 200),
+          "fullscreen supports a matched negative-origin display")
     // Independently paired Chrome pointer/DOM and AX target measurements from this Mac.
     let realDisplay = RegionDisplay(id: 1, bounds: CGRect(x: 0, y: 0, width: 1470, height: 956), scale: 2)
     for (zoom, dpr, client, size, target, cssTarget): (CGFloat, CGFloat, CGPoint, CGSize, CGRect, CGRect) in [
@@ -1765,6 +1849,34 @@ func selfTest() throws {
     assert(bridge.region != nil && bridge.regionContext?.browser == nil)
     assert(!bridge.markdown(bridge.original!).contains("Estimated selection"), "Post-image browser context cannot supply CSS coordinates")
     bridge.setEnabled(false)
+    for invalidateBeforeMatch in [false, true] {
+        _ = startSelection(beforeMouseDown: { id in
+            var reply = pageReply(id)
+            reply["pointerAnchor"] = nil
+            reply["window"] = ["focused": true, "state": "fullscreen", "left": -90, "top": -40, "width": 450, "height": 350]
+            reply["viewport"] = ["width": 450, "height": 350]
+            reply["pointerCalibration"] = ["enabled": true, "focused": true, "visibility": "visible", "status": "window-scroll"]
+            reply["observedAt"] = iso(bridge.gestureContext!.date)
+            bridge.receive(reply)
+        })
+        if invalidateBeforeMatch { bridge.receive(invalidate) }
+        putImage(); app = "com.openai.codex"; bridge.tick()
+        let paths = bridge.files!, before = try Data(contentsOf: paths[1])
+        let md = String(decoding: before, as: UTF8.self)
+        assert(md.contains("- Browser window fullscreen: true") && !md.contains("- Retained pointer calibration age:"))
+        assert(!md.contains("- Pointer calibration:") && !md.contains("Retained pointer calibration age at browser observation"))
+        if invalidateBeforeMatch {
+            assert(!md.contains("Estimated selection") && md.contains("browser geometry changed"))
+        } else {
+            assert(md.contains("Estimated selection in viewport CSS pixels: x=10.0, y=20.0, width=4.0, height=3.0"))
+            assert(md.contains("Estimated selection in top-document CSS pixels: x=21.0, y=120.0, width=4.0, height=3.0"))
+            assert(md.contains("matching fullscreen browser/page-window bounds") && md.contains("no pointer calibration was required"))
+        }
+        let preservedPNG = try Data(contentsOf: paths[0]); assert(preservedPNG == png)
+        bridge.receive(invalidate)
+        let after = try Data(contentsOf: paths[1]); assert(after == before, "Completed fullscreen context is immutable")
+        bridge.setEnabled(false)
+    }
     func blockPreparedRewrite() throws -> [URL] {
         let paths = bridge.files!
         try FileManager.default.moveItem(at: paths[1], to: paths[1].appendingPathExtension("saved"))

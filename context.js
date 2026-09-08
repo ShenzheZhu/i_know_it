@@ -23,6 +23,7 @@
     };
   }
   const geometry = page => JSON.stringify({ ...page, title: undefined });
+  const calibrationGeometry = page => geometry({ ...page, scroll: undefined });
   function report(force = false, reason = 'geometry-changed') {
     if (!enabled) { anchor = undefined; return; }
     if (document.visibilityState !== 'visible') { clearAnchor('hidden'); return; }
@@ -30,7 +31,7 @@
     const current = geometry(page);
     const geometryChanged = force === true || current !== previous;
     if (!geometryChanged && page.title === previousTitle) return;
-    if (geometryChanged) clearAnchor(reason);
+    if (anchor && anchor.signature !== calibrationGeometry(page)) clearAnchor(reason);
     previous = current; previousTitle = page.title;
     try { chrome.runtime.sendMessage({ type: 'context-changed', geometryChanged }).catch(() => {}); }
     catch { enabled = false; clearAnchor('extension-unavailable'); }
@@ -79,10 +80,11 @@
           ? 'invalid-pointer-data' : now - event.timeStamp < 0 || now - event.timeStamp > 100
             ? 'out-of-time-pointer' : undefined;
     if (rejected) { if (!anchor) calibrationStatus = rejected; return; }
-    // ponytail: retain one calibration while its geometry stays unchanged, not a pointer trace.
+    // Scrolling changes document coordinates, not the screen-to-viewport origin.
+    // ponytail: retain one calibration while its origin geometry stays unchanged, not a pointer trace.
     anchor = {
       screen: { x: event.screenX, y: event.screenY }, client: { x: event.clientX, y: event.clientY },
-      time: event.timeStamp, observedAt: new Date().toISOString(), signature: previous,
+      time: event.timeStamp, observedAt: new Date().toISOString(), signature: calibrationGeometry(snapshot()),
     };
     calibrationStatus = 'ready';
   }, { passive: true });
@@ -90,7 +92,8 @@
   globalThis.__iKnowItPageContext = () => {
     const page = snapshot();
     const ageMs = anchor ? performance.now() - anchor.time : Infinity;
-    if (anchor && anchor.signature !== geometry(page)) invalidate('geometry-mismatch');
+    if (anchor && anchor.signature !== calibrationGeometry(page)) invalidate('geometry-mismatch');
+    else if (geometry(page) !== previous) report();
     if (enabled && document.visibilityState === 'visible' && !document.pointerLockElement && anchor
       && Number.isFinite(ageMs) && ageMs >= 0) {
       page.pointerAnchor = { screen: anchor.screen, client: anchor.client, ageMs, observedAt: anchor.observedAt };
@@ -104,7 +107,9 @@
     };
     return page;
   };
-  for (const event of ['scroll', 'resize', 'hashchange', 'popstate']) {
+  // Even an equal-value scroll signal invalidates pending screenshot snapshots.
+  addEventListener('scroll', () => report(true, 'window-scroll'), { passive: true });
+  for (const event of ['resize', 'hashchange', 'popstate']) {
     addEventListener(event, () => invalidate(`window-${event}`), { passive: true });
   }
   addEventListener('pageshow', event => { if (event.persisted) readState(); else report(); }, { passive: true });

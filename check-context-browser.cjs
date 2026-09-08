@@ -92,7 +92,7 @@ const server = http.createServer((_request, response) => {
     const browserSession = await browser.newBrowserCDPSession();
     const installed = await browserSession.send('Extensions.loadUnpacked', { path: extension, enableInIncognito: false });
     const workerURL = `chrome-extension://${installed.id}/`;
-    const worker = context.serviceWorkers().find(worker => worker.url().startsWith(workerURL))
+    let worker = context.serviceWorkers().find(worker => worker.url().startsWith(workerURL))
       || await context.waitForEvent('serviceworker', { predicate: worker => worker.url().startsWith(workerURL) });
     await worker.evaluate(async () => { await __contextTest.ready; });
     const tabId = await worker.evaluate(async url => (await chrome.tabs.query({})).find(tab => tab.url === url)?.id, page.url());
@@ -254,11 +254,19 @@ const server = http.createServer((_request, response) => {
     assert.equal((await read()).pointerAnchor, undefined, 'OFF must stop collecting anchors');
     await toggle(true);
     assert.equal((await read()).pointerAnchor, undefined, 'ON must not revive a pre-OFF anchor');
-    await seed();
+    const beforeScroll = (await seed()).pointerAnchor;
     await page.evaluate(() => scrollTo(0, 150));
     const scrolled = await read();
     assert.equal(scrolled.scroll.y, 150);
-    assert.equal(scrolled.pointerAnchor, undefined, 'Scrolling must invalidate an anchor');
+    assert(scrolled.pointerAnchor.ageMs >= beforeScroll.ageMs);
+    assert.deepEqual({ ...scrolled.pointerAnchor, ageMs: beforeScroll.ageMs }, beforeScroll,
+      'Document scrolling without pointer movement retains calibration coordinates and original timestamp');
+    await page.evaluate(() => scrollTo(0, 0));
+    const scrolledBack = await read();
+    assert.equal(scrolledBack.scroll.y, 0);
+    assert(scrolledBack.pointerAnchor.ageMs >= scrolled.pointerAnchor.ageMs);
+    assert.deepEqual({ ...scrolledBack.pointerAnchor, ageMs: beforeScroll.ageMs }, beforeScroll,
+      'Scrollback without pointer movement retains the same original calibration');
     await seed();
     await page.setViewportSize({ width: 900, height: 650 });
     const resized = await read();
@@ -272,8 +280,46 @@ const server = http.createServer((_request, response) => {
     assert.equal(navigated.pointerAnchor, undefined, 'Navigation must not carry an old document anchor');
     assert.equal(await page.evaluate(() => typeof globalThis.__iKnowItPageContext), 'undefined');
     await seed();
+    const documentBeforeReload = await page.evaluate(() => performance.timeOrigin);
+    await worker.evaluate(async id => {
+      await chrome.scripting.executeScript({ target: { tabId: id }, func: () => {
+        globalThis.__contextBeforeReload = true;
+      } });
+    }, tabId);
+    const oldWorker = worker;
+    [worker] = await Promise.all([
+      context.waitForEvent('serviceworker', { timeout: 10_000,
+        predicate: candidate => candidate !== oldWorker && candidate.url().startsWith(workerURL) }),
+      oldWorker.evaluate(() => { setTimeout(() => chrome.runtime.reload(), 100); }),
+    ]);
+    let readyTimeout;
+    try {
+      await Promise.race([
+        worker.evaluate(async () => { await __contextTest.ready; }),
+        new Promise((_, reject) => { readyTimeout = setTimeout(() => reject(new Error('Reloaded extension did not become ready within 10 seconds')), 10_000); }),
+      ]);
+    } finally { clearTimeout(readyTimeout); }
+    const reloadedCollector = await worker.evaluate(async id => {
+      const results = await chrome.scripting.executeScript({ target: { tabId: id }, func: () => ({
+        oldMarker: globalThis.__contextBeforeReload === true,
+        getter: typeof globalThis.__iKnowItPageContext,
+      }) });
+      return results.find(result => result.frameId === 0)?.result;
+    }, tabId);
+    assert.deepEqual(reloadedCollector, { oldMarker: false, getter: 'function' },
+      'Extension reload must initialize a fresh isolated collector despite the old world guard');
+    assert.equal(await page.evaluate(() => performance.timeOrigin), documentBeforeReload,
+      'Extension reload recovery must not reload the open webpage');
+    const afterReload = (await seed()).pointerAnchor;
+    await page.evaluate(() => scrollTo(0, 150));
+    const afterReloadScroll = await read();
+    assert.equal(afterReloadScroll.scroll.y, 150);
+    assert(afterReloadScroll.pointerAnchor.ageMs >= afterReload.ageMs);
+    assert.deepEqual({ ...afterReloadScroll.pointerAnchor, ageMs: afterReload.ageMs }, afterReload,
+      'The replacement collector must retain calibration across scroll without pointer movement');
+    console.log('PASS: runtime.reload replaces the isolated collector and preserves normal scroll behavior without webpage reload');
     assert.deepEqual(errors, []);
-    console.log('PASS: real Chromium extension isolated world; production background executeScript reads trusted calibration beyond one stationary second without renewing timestamps; synthetic input and main-world getter spoofing rejected; equal-size resize and getter mismatch cannot resurrect old calibration; hidden-tab and lifecycle signals, OFF/ON, navigation, scroll, and resize invalidation. Native macOS geometry and target-app paste are outside this check.');
+    console.log('PASS: real Chromium extension isolated world; production background executeScript reads trusted calibration beyond one stationary second and across document scroll/scrollback without renewing timestamps; synthetic input and main-world getter spoofing rejected; equal-size resize and getter mismatch cannot resurrect old calibration; hidden-tab and lifecycle signals, OFF/ON, navigation, and resize invalidation. Native macOS geometry and target-app paste are outside this check.');
   } finally {
     await new Promise(resolve => server.close(resolve));
     if (browser) await Promise.race([browser.close().catch(() => {}), delay(2000)]);

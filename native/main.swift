@@ -692,7 +692,13 @@ final class Bridge {
             for key in ["windowId", "tabId", "zoom", "devicePixelRatio"] {
                 if let number = browser[key] as? NSNumber { lines.append("- \(key): \(number)") }
             }
-            if let fullscreen = browser["fullscreen"] as? Bool { lines.append("- fullscreen: \(fullscreen)") }
+            let windowState = (browser["window"] as? [String: Any])?["state"] as? String
+            let knownState = windowState.flatMap { ["normal", "minimized", "maximized", "fullscreen"].contains($0) ? $0 : nil }
+            lines.append("- Browser window state: \(knownState ?? "unknown")")
+            lines.append("- Browser window fullscreen: \(knownState.map { String($0 == "fullscreen") } ?? "unknown")")
+            let elementFullscreen = browser["fullscreen"] as? NSNumber
+            let elementState = elementFullscreen.flatMap { CFGetTypeID($0) == CFBooleanGetTypeID() ? String($0.boolValue) : nil }
+            lines.append("- Document element fullscreen: \(elementState ?? "unknown")")
             if browser["pageAvailable"] as? Bool == false {
                 let reason = browser["pageUnavailableReason"] as? String == "browser-internal-page" ? "browser-internal page" : "page could not be read"
                 lines.append("- Page measurements: unavailable (\(reason)); viewport and scroll were not read.")
@@ -1559,6 +1565,35 @@ func selfTest() throws {
     assert(missingCalibrationMD.contains("- Pointer calibration state:") && missingCalibrationMD.contains("unfocused-pointer"))
     assert(!missingCalibrationMD.contains("Estimated selection") && !missingCalibrationMD.contains("- Pointer calibration:"),
            "Missing-calibration diagnostics must not invent an anchor or an estimate")
+    for (state, expectedState, expectedFullscreen): (Any?, String, String) in [
+        ("normal", "normal", "false"), ("minimized", "minimized", "false"),
+        ("maximized", "maximized", "false"), ("fullscreen", "fullscreen", "true"),
+        (nil, "unknown", "unknown"), ("unexpected", "unknown", "unknown"), (1, "unknown", "unknown")
+    ] {
+        app = "com.google.Chrome"; putImage(); bridge.tick()
+        var window: [String: Any] = ["focused": true]
+        window["state"] = state
+        bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
+                        "pageAvailable": true, "url": "https://example.com/", "window": window, "fullscreen": false])
+        let md = bridge.markdown(bridge.original!)
+        assert(md.contains("- Browser window state: \(expectedState)\n"))
+        assert(md.contains("- Browser window fullscreen: \(expectedFullscreen)\n"))
+        assert(md.contains("- Document element fullscreen: false") && !md.contains("- fullscreen:"))
+    }
+    for (value, expected): (Any, String) in [(true, "true"), (false, "false"), (1, "unknown"), ("true", "unknown"), (NSNull(), "unknown")] {
+        app = "com.google.Chrome"; putImage(); bridge.tick()
+        bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
+                        "pageAvailable": true, "url": "https://example.com/", "fullscreen": value,
+                        "window": ["focused": true, "state": "normal"]])
+        let md = bridge.markdown(bridge.original!)
+        assert(md.contains("- Browser window fullscreen: false") && md.contains("- Document element fullscreen: \(expected)\n"))
+    }
+    app = "com.google.Chrome"; putImage(); bridge.tick()
+    bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
+                    "pageAvailable": true, "url": "chrome://extensions/", "fullscreen": true,
+                    "window": ["focused": true, "state": "fullscreen"]])
+    let internalFullscreenMD = bridge.markdown(bridge.original!)
+    assert(internalFullscreenMD.contains("- Browser window fullscreen: true") && internalFullscreenMD.contains("- Document element fullscreen: unknown"))
 
     // Exercise the real bridge with decoded input and a private pasteboard, never a global tap.
     var now: TimeInterval = 1000
@@ -1693,7 +1728,7 @@ func selfTest() throws {
         }
         assert(bridge.regionContext?.browser?["pointerAnchor"] != nil && md.contains("Observed raw drag extent") && md.contains("source-a"))
         let savedCalibration = bridge.regionContext!.browser!["pointerAnchor"] as! [String: Any]
-        assert(md.contains(savedCalibration["observedAt"] as! String) && md.contains("- Pointer calibration:") && md.contains("- Page window:") && md.contains("- fullscreen: false"))
+        assert(md.contains(savedCalibration["observedAt"] as! String) && md.contains("- Pointer calibration:") && md.contains("- Page window:") && md.contains("- Document element fullscreen: false"))
         assert(md.contains("- Pointer calibration state:") && md.contains("\"status\":\"ready\""))
         if !invalidBeforeCapture {
             assert(md.contains("Retained pointer calibration age at browser observation: 60000.0 ms") && md.contains("Unobserved browser-chrome changes"))

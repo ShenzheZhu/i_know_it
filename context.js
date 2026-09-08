@@ -35,7 +35,10 @@
     try { chrome.runtime.sendMessage({ type: 'context-changed', geometryChanged }).catch(() => {}); }
     catch { enabled = false; clearAnchor('extension-unavailable'); }
   }
-  function invalidate(reason = 'geometry-changed') { clearAnchor(reason); report(true, reason); }
+  function invalidate(reason = 'geometry-changed') {
+    if (!enabled) return;
+    clearAnchor(reason); report(true, reason);
+  }
   function setEnabled(value) {
     stateRevision++;
     if (enabled && value === true) { report(); return; }

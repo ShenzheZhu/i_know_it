@@ -121,11 +121,14 @@ struct RegionGestureTracker {
         var observation: RegionObservation?
     }
     private var selection: Selection?
+    private(set) var diagnostic = "No matching screenshot selection was observed."
     var isArmed: Bool { selection != nil }
     var isSelecting: Bool { selection != nil && selection?.observation == nil }
     var startedAt: TimeInterval? { selection?.startedAt }
 
-    mutating func reset() { selection = nil }
+    mutating func reset(_ reason: String = "Selection tracking was reset.") {
+        selection = nil; diagnostic = reason
+    }
 
     private static let modifiers: CGEventFlags = [
         .maskShift, .maskControl, .maskAlternate, .maskCommand,
@@ -162,7 +165,9 @@ struct RegionGestureTracker {
                           location: CGPoint = .zero, clipboardCount: Int,
                           displays: [RegionDisplay], now: TimeInterval) -> Bool {
         let modifiers = flags.intersection(Self.modifiers)
-        if isArmed && !current(now: now, displays: displays) { reset() }
+        if isArmed && !current(now: now, displays: displays) {
+            reset("Selection expired, event time was invalid, or display layout changed.")
+        }
         let wasArmed = isArmed
         if type == .keyDown && keycode == 21 {
             defer { if wasArmed { reset() } }
@@ -171,22 +176,23 @@ struct RegionGestureTracker {
                   Self.valid(displays) else { return false }
             selection = Selection(startedAt: now, clipboardCount: clipboardCount,
                                   displays: displays.sorted(by: { $0.id < $1.id }), lastAt: now)
+            diagnostic = "Shortcut observed; waiting for mouse-down."
             return true
         }
         guard var state = selection else { return false }
         guard clipboardCount == state.clipboardCount ||
                 (state.observation != nil && clipboardCount == state.clipboardCount + 1) else {
-            reset(); return false
+            reset("Clipboard changed before selection completed, or changed more than once."); return false
         }
         // Caps Lock and event-delivery flags do not affect the native selection.
         let other = modifiers.subtracting(.maskControl)
         if state.start == nil {
             guard other.subtracting(state.remainingShortcutModifiers).isEmpty else {
-                reset(); return false
+                reset("Unsupported selection modifiers were observed."); return false
             }
             state.remainingShortcutModifiers.formIntersection(other)
         } else if !other.isEmpty {
-            reset(); return false
+            reset("Unsupported selection modifiers were observed."); return false
         }
         switch type {
         case .flagsChanged, .mouseMoved:
@@ -195,19 +201,20 @@ struct RegionGestureTracker {
             state.keyReleased = true
         case .leftMouseDown:
             guard state.start == nil, other.isEmpty,
-                  Self.integral(location.x), Self.integral(location.y) else {
-                reset(); return false
+                  location.x.isFinite, location.y.isFinite else {
+                reset("Mouse-down was repeated, modified, or nonfinite."); return false
             }
             state.start = location
+            diagnostic = "Mouse-down observed; waiting for mouse-up."
         case .leftMouseDragged:
             guard state.start != nil, state.observation == nil,
-                  Self.integral(location.x), Self.integral(location.y) else {
-                reset(); return false
+                  location.x.isFinite, location.y.isFinite else {
+                reset("Drag was out of sequence or nonfinite."); return false
             }
         case .leftMouseUp:
             guard let start = state.start, state.observation == nil,
-                  Self.integral(location.x), Self.integral(location.y) else {
-                reset(); return false
+                  location.x.isFinite, location.y.isFinite else {
+                reset("Mouse-up was out of sequence or nonfinite."); return false
             }
             let rect = CGRect(x: min(start.x, location.x), y: min(start.y, location.y),
                               width: abs(location.x - start.x), height: abs(location.y - start.y))
@@ -216,21 +223,22 @@ struct RegionGestureTracker {
                 rect.maxX <= $0.bounds.maxX && rect.maxY <= $0.bounds.maxY
             }
             guard rect.width > 0, rect.height > 0, candidates.count == 1 else {
-                reset(); return false
+                reset("Selection had zero area or did not belong to one unambiguous display."); return false
             }
             let display = candidates[0]
             let pixels = CGRect(x: (rect.minX - display.bounds.minX) * display.scale,
                                 y: (rect.minY - display.bounds.minY) * display.scale,
                                 width: rect.width * display.scale, height: rect.height * display.scale)
             guard [pixels.minX, pixels.minY, pixels.width, pixels.height,
-                   pixels.maxX, pixels.maxY].allSatisfy(Self.integral),
+                   pixels.maxX, pixels.maxY].allSatisfy({ $0.isFinite }),
                   pixels.width < CGFloat(Int.max), pixels.height < CGFloat(Int.max) else {
-                reset(); return false
+                reset("Selection pixel extent was invalid."); return false
             }
             state.observation = RegionObservation(startedAt: state.startedAt, completedAt: now,
                                                   display: display, globalRect: rect, displayPixelRect: pixels)
+            diagnostic = "Mouse-up observed; waiting for a matching clipboard image."
         default:
-            reset(); return false
+            reset("Unsupported or out-of-sequence input cancelled selection tracking."); return false
         }
         state.lastAt = now
         selection = state
@@ -241,16 +249,26 @@ struct RegionGestureTracker {
     // may share one changeCount; do not consume the selection for an empty read.
     mutating func consume(width: Int, height: Int, clipboardCount: Int,
                           displays: [RegionDisplay], now: TimeInterval) -> RegionObservation? {
-        guard current(now: now, displays: displays), let state = selection else {
-            reset(); return nil
+        guard let state = selection else { return nil }
+        guard current(now: now, displays: displays) else {
+            reset("Selection expired, event time was invalid, or display layout changed."); return nil
         }
         if clipboardCount == state.clipboardCount { return nil }
-        defer { reset() }
-        guard clipboardCount == state.clipboardCount + 1,
-              let result = state.observation,
-              width > 0, height > 0,
-              CGFloat(width) == result.displayPixelRect.width,
-              CGFloat(height) == result.displayPixelRect.height else { return nil }
+        defer { selection = nil }
+        guard clipboardCount == state.clipboardCount + 1 else {
+            diagnostic = "Clipboard changed more than once or its counter reversed."; return nil
+        }
+        guard let result = state.observation else {
+            diagnostic = "Clipboard image arrived before mouse-up was observed."; return nil
+        }
+        // ponytail: time/size correlation only; allow one logical point of rounding
+        // at each edge, but retain raw pointer coordinates rather than guess macOS's crop.
+        let tolerance = 2 * result.display.scale
+        guard tolerance.isFinite, width > 0, height > 0,
+              abs(CGFloat(width) - result.displayPixelRect.width) <= tolerance,
+              abs(CGFloat(height) - result.displayPixelRect.height) <= tolerance else {
+            diagnostic = "Clipboard image dimensions did not match the observed drag within the rounding tolerance."; return nil
+        }
         return result
     }
 }
@@ -292,6 +310,7 @@ final class Bridge {
     var gestureContext: GestureContext?
     var region: RegionObservation?
     var regionContext: GestureContext?
+    var regionDiagnostic: String?
 
     init(board: NSPasteboard, directory: URL, currentApp: @escaping () -> String?, request: @escaping (String) -> Void) {
         self.board = board; self.directory = directory; self.currentApp = currentApp; self.request = request
@@ -302,7 +321,7 @@ final class Bridge {
         enabled = value
         if !value {
             restore(); original = nil; files = nil; browser = nil; requestID = nil
-            cancelGesture(); region = nil; regionContext = nil
+            cancelGesture(); region = nil; regionContext = nil; regionDiagnostic = nil
         }
         seen = board.changeCount
         enabledChanged(value)
@@ -369,16 +388,19 @@ final class Bridge {
                 "- Shortcut: Control + Shift + Command + 4",
                 "- Shortcut observed at: \(iso(context.date))",
                 "- Foreground app at shortcut: \(quoted(context.app ?? "unknown"))",
-                "- Selection in global display points: \(rect(region.globalRect))",
+                "- Observed raw drag extent in global display points: \(rect(region.globalRect))",
                 "- Coordinate system: primary display top-left origin; x right, y down; other displays can have negative origins.",
                 "- Display ID: \(region.display.id)",
                 "- Display bounds in global points: \(rect(region.display.bounds))",
                 "- Display backing scale: \(region.display.scale)",
-                "- Selection in this display's image pixels: \(rect(region.displayPixelRect))",
-                "- Match: one clipboard change within 2 seconds of mouse-up, with identical image dimensions.",
+                "- Observed raw drag extent in this display's backing pixels: \(rect(region.displayPixelRect))",
+                "- Match: one clipboard change within 2 seconds of mouse-up; each image dimension differs from the raw drag extent by at most \(2 * region.display.scale) pixels (one logical point of rounding per edge). This is a heuristic tolerance, not a measured macOS rounding rule.",
+                "- Coordinate precision: raw pointer coordinates are preserved and may be fractional; they are not the exact image crop rectangle.",
                 "- Evidence limit: this is an observed drag matched by time and size, not a macOS capture receipt. It does not verify the source app, page, or crop origin.",
                 "- Web-page CSS coordinates: unknown; browser chrome, side panels, and zoom prevent deriving them from window bounds.",
                 "- Re-observe the live display before clicking; its layout may have changed."]
+        } else if let regionDiagnostic {
+            lines.append("- Last selection tracking status (may predate this image): \(regionDiagnostic)")
         }
         if let browser {
             lines += ["", region == nil ? "## Browser tab observed after the clipboard changed" : "## Browser context requested at the screenshot shortcut"]
@@ -412,13 +434,14 @@ final class Bridge {
         if count != seen {
             // An external copy always replaces our pending work; never restore over a newer copy.
             owned = nil; ownershipToken = nil; original = nil; files = nil; browser = nil; requestID = nil
-            region = nil; regionContext = nil
+            region = nil; regionContext = nil; regionDiagnostic = nil
             // Clearing and filling a pasteboard can share one change count. Wait for its contents.
             guard let entries = board.pasteboardItems, !entries.isEmpty else { return }
             seen = count
             guard let image = ClipboardImage(board), board.changeCount == count else { cancelGesture(); return }
             original = image; observedAt = Date(); observedApp = currentApp()
             region = gesture.consume(width: image.width, height: image.height, clipboardCount: count, displays: displays(), now: clock())
+            if region == nil { regionDiagnostic = gesture.diagnostic }
             if region != nil { regionContext = gestureContext; browser = gestureContext?.browser }
             cancelGesture()
             if region == nil && browserApps.contains(observedApp ?? "") {
@@ -610,12 +633,49 @@ func regionSelfTest() {
     check(retina?.display == primary, "display identity")
     check(!tracker.isArmed && consume(&tracker) == nil, "consume once")
 
+    tracker = armed()
+    event(&tracker, .leftMouseDown, 100, 200)
+    event(&tracker, .leftMouseDragged, 199.81640625, 269.23828125, time: 101.2)
+    check(tracker.isArmed, "finite fractional intermediate drag does not cancel")
+    event(&tracker, .leftMouseUp, 400, 450, time: 101.5)
+    check(consume(&tracker)?.globalRect == retina?.globalRect, "fractional intermediate position does not change endpoints")
+
+    // Reproduces fractional CGEvent locations observed on the user's Mac.
+    let fractionalStart = CGPoint(x: 499.81640625, y: 769.23828125)
+    let fractionalEnd = CGPoint(x: 696.2890625, y: 472.0546875)
+    for reversed in [false, true] {
+        for size in [(393, 594), (390, 591), (396, 598)] {
+            tracker = completed(start: reversed ? fractionalEnd : fractionalStart,
+                                end: reversed ? fractionalStart : fractionalEnd)
+            let result = consume(&tracker, width: size.0, height: size.1)
+            check(result?.globalRect == CGRect(x: 499.81640625, y: 472.0546875,
+                                               width: 196.47265625, height: 297.18359375), "raw fractional endpoints preserved in either direction")
+            check(result?.displayPixelRect == CGRect(x: 999.6328125, y: 944.109375,
+                                                     width: 392.9453125, height: 594.3671875), "Retina scaling retains fractional pixel extent")
+        }
+    }
+    for size in [(388, 594), (393, 599)] {
+        tracker = completed(start: fractionalStart, end: fractionalEnd)
+        check(consume(&tracker, width: size.0, height: size.1) == nil && !tracker.isArmed,
+              "fractional image mismatch beyond rounding tolerance rejected")
+        check(tracker.diagnostic.contains("rounding tolerance"), "dimension mismatch diagnostic retained after consume")
+    }
+    for size in [(596, 496), (604, 504)] {
+        tracker = completed()
+        check(consume(&tracker, width: size.0, height: size.1) != nil, "inclusive two-edge Retina rounding tolerance")
+    }
+
     for reversed in [false, true] {
         let a = CGPoint(x: -1800, y: -100), b = CGPoint(x: -1500, y: 150)
         tracker = completed(start: reversed ? b : a, end: reversed ? a : b)
         let result = consume(&tracker, width: 300, height: 250)
         check(result?.globalRect == CGRect(x: -1800, y: -100, width: 300, height: 250), "negative origin and reverse drag")
         check(result?.displayPixelRect == CGRect(x: 120, y: 100, width: 300, height: 250), "secondary screen local pixels")
+        let c = CGPoint(x: -1800.25, y: -100.5), d = CGPoint(x: -1500.75, y: 150.25)
+        tracker = completed(start: reversed ? d : c, end: reversed ? c : d)
+        let fractional = consume(&tracker, width: 300, height: 251)
+        check(fractional?.globalRect == CGRect(x: -1800.25, y: -100.5, width: 299.5, height: 250.75), "negative fractional endpoints preserved")
+        check(fractional?.displayPixelRect == CGRect(x: 119.75, y: 99.5, width: 299.5, height: 250.75), "secondary fractional local pixels")
     }
     tracker = completed(start: CGPoint(x: 1440, y: 900), end: CGPoint(x: 0, y: 0))
     check(consume(&tracker, width: 2880, height: 1800) != nil, "exact screen bounds")
@@ -716,9 +776,9 @@ func regionSelfTest() {
         tracker = completed()
         check(consume(&tracker, count: count) == nil && !tracker.isArmed, "counter reversal/jump rejects")
     }
-    for size in [(599, 500), (600, 499), (0, 500), (600, 0), (-1, 500), (1200, 1000)] {
+    for size in [(595, 500), (605, 500), (600, 495), (600, 505), (0, 500), (600, 0), (-1, 500), (1200, 1000)] {
         tracker = completed()
-        check(consume(&tracker, width: size.0, height: size.1) == nil && !tracker.isArmed, "exact image dimensions required")
+        check(consume(&tracker, width: size.0, height: size.1) == nil && !tracker.isArmed, "image dimensions outside tolerance rejected")
     }
     tracker = completed()
     check(consume(&tracker, time: 103.5) != nil, "inclusive result timeout")
@@ -749,9 +809,16 @@ func regionSelfTest() {
     check(!tracker.isArmed, "zero area rejected")
     tracker = completed(screens: [primary, RegionDisplay(id: 2, bounds: primary.bounds, scale: 2)])
     check(!tracker.isArmed, "overlapping mirrored displays ambiguous")
-    for x in [CGFloat.nan, .infinity, 100.5] {
-        tracker = completed(start: CGPoint(x: x, y: 200))
-        check(!tracker.isArmed, "nonfinite/fractional points rejected")
+    for invalid in [CGFloat.nan, .infinity, -.infinity] {
+        for point in [CGPoint(x: invalid, y: 200), CGPoint(x: 100, y: invalid)] {
+            for type in [CGEventType.leftMouseDown, .leftMouseDragged, .leftMouseUp] {
+                tracker = armed()
+                if type != .leftMouseDown { event(&tracker, .leftMouseDown, 100, 200) }
+                event(&tracker, type, point.x, point.y)
+                check(!tracker.isArmed, "nonfinite pointer coordinates rejected at every drag stage")
+                check(tracker.diagnostic.contains("nonfinite"), "nonfinite cancellation diagnostic retained")
+            }
+        }
     }
     for screens in [[], [primary, primary], [RegionDisplay(id: 1, bounds: primary.bounds, scale: .nan)],
                     [RegionDisplay(id: 0, bounds: primary.bounds, scale: 1)],
@@ -945,7 +1012,9 @@ func selfTest() throws {
     var now: TimeInterval = 1000
     bridge.clock = { now }
     bridge.displays = { [RegionDisplay(id: 7, bounds: CGRect(x: -100, y: -50, width: 500, height: 400), scale: 1)] }
-    func startSelection(replyBeforeEnd: Bool = false) -> String {
+    func startSelection(replyBeforeEnd: Bool = false,
+                        start: CGPoint = CGPoint(x: -80, y: -20),
+                        end: CGPoint = CGPoint(x: -76, y: -17)) -> String {
         bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
         now += 10
         bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
@@ -953,9 +1022,10 @@ func selfTest() throws {
         let id = requested
         if replyBeforeEnd { bridge.receive(selectionReply(id)) }
         bridge.observeGesture(type: .flagsChanged, flags: [])
-        bridge.observeGesture(type: .leftMouseDown, flags: [], location: CGPoint(x: -80, y: -20))
+        bridge.observeGesture(type: .leftMouseDown, flags: [], location: start)
+        bridge.observeGesture(type: .leftMouseDragged, flags: [], location: CGPoint(x: -78.25, y: -18.75))
         now += 0.2
-        bridge.observeGesture(type: .leftMouseUp, flags: [], location: CGPoint(x: -76, y: -17))
+        bridge.observeGesture(type: .leftMouseUp, flags: [], location: end)
         return id
     }
     func selectionReply(_ id: String, url: String = "https://example.com/source-a") -> [String: Any] {
@@ -973,6 +1043,8 @@ func selfTest() throws {
     let selectionMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
     assert(selectionMD.contains("source-a") && selectionMD.contains("correlated, not verified") && selectionMD.contains("x=-80.0"))
     assert(selectionMD.contains("requested at the screenshot shortcut") && !selectionMD.contains("## Browser tab observed after"))
+    assert(selectionMD.contains("raw drag extent") && selectionMD.contains("at most 2.0 pixels") && !selectionMD.contains("identical image dimensions"))
+    assert(!selectionMD.contains("- Last selection tracking status"))
     let regionPNG = try Data(contentsOf: bridge.files![0]); assert(regionPNG == png)
     // A post-copy reply cannot overwrite the request made at the shortcut.
     bridge.receive(selectionReply("unrelated", url: "https://example.com/later-b"))
@@ -1001,6 +1073,20 @@ func selfTest() throws {
     bridge.observeGesture(type: .keyDown, flags: [], keycode: 49)
     putImage(); bridge.tick()
     assert(bridge.region == nil && bridge.requestID != nil, "Window/move mode cannot produce guessed geometry")
+    assert(bridge.markdown(bridge.original!).contains("Unsupported or out-of-sequence input cancelled selection tracking."))
+
+    _ = startSelection(start: CGPoint(x: -80.25, y: -20.25), end: CGPoint(x: -75.75, y: -16.5))
+    putImage(); app = "com.openai.codex"; bridge.tick()
+    assert(bridge.region?.globalRect == CGRect(x: -80.25, y: -20.25, width: 4.5, height: 3.75))
+    let fractionalMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
+    assert(fractionalMD.contains("x=-80.25") && fractionalMD.contains("width=4.5, height=3.75"))
+    assert(fractionalMD.contains("not the exact image crop rectangle"))
+    _ = startSelection(end: CGPoint(x: -73, y: -17))
+    putImage(); app = "com.openai.codex"; bridge.tick()
+    assert(bridge.region == nil && bridge.regionDiagnostic?.contains("rounding tolerance") == true)
+    let mismatchMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
+    assert(mismatchMD.contains("- Last selection tracking status (may predate this image):") && mismatchMD.contains("rounding tolerance"))
+    assert(!mismatchMD.contains("Observed raw drag extent"))
     bridge.setEnabled(false)
 
     var permissionRequests = 0, inputStates: [String] = []

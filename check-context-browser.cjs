@@ -200,7 +200,7 @@ const server = http.createServer((_request, response) => {
     }, tabId);
     assert.equal(restoredGeometry.changed.pointerAnchor, undefined);
     assert.equal(restoredGeometry.restored.pointerAnchor, undefined, 'Returning to identical geometry without intervening events cannot resurrect calibration');
-    await seed();
+    const beforeHide = (await seed()).pointerAnchor;
     await page.mouse.move(-20, -20);
     const logVisibility = async stage => console.log(JSON.stringify({ check: 'real-tab-visibility', stage,
       document: await page.evaluate(() => ({ visibility: document.visibilityState, focused: document.hasFocus() })),
@@ -218,10 +218,24 @@ const server = http.createServer((_request, response) => {
       await logVisibility('switched-away');
       // Animation-frame polling pauses in a hidden tab; use a bounded real-state timer.
       await page.waitForFunction(() => document.visibilityState === 'hidden', undefined, { polling: 100, timeout: 10_000 });
+      assert.equal((await read()).pointerAnchor, undefined, 'A hidden fixture tab must expose no calibration');
       await worker.evaluate(id => chrome.tabs.update(id, { active: true }), tabId);
       await page.waitForFunction(() => document.visibilityState === 'visible', undefined, { polling: 100, timeout: 10_000 });
       await logVisibility('returned');
-      assert.equal((await read()).pointerAnchor, undefined, 'Hiding and reopening the real fixture tab must clear calibration');
+      const returned = (await read()).pointerAnchor;
+      if (returned) {
+        // Showing the tab can dispatch a new trusted pointer event; only the old calibration must stay cleared.
+        assert.notEqual(returned.observedAt, beforeHide.observedAt, 'Reopening must not resurrect pre-hide calibration');
+        const pointer = await worker.evaluate(async id => {
+          const results = await chrome.scripting.executeScript({ target: { tabId: id },
+            func: () => globalThis.__contextSeedDebug.pointer });
+          return results.find(result => result.frameId === 0)?.result;
+        }, tabId);
+        assert(pointer?.trusted && pointer.type === 'mouse' && pointer.buttons === 0 && pointer.modifiers.every(value => !value),
+          'A replacement calibration requires a new eligible trusted mouse observation');
+        assert.deepEqual(returned.client, pointer.client);
+        assert.deepEqual(returned.screen, pointer.screen);
+      }
     } catch (error) {
       await logVisibility('failed');
       throw error;

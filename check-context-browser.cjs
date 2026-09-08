@@ -111,10 +111,11 @@ const server = http.createServer((_request, response) => {
     await page.mouse.move(-20, -20);
     const otherPage = await context.newPage();
     await otherPage.bringToFront();
-    await page.waitForFunction(() => document.visibilityState === 'hidden');
+    // requestAnimationFrame polling stops in a hidden tab; keep this real visibility check timer-based.
+    await page.waitForFunction(() => document.visibilityState === 'hidden', undefined, { polling: 100, timeout: 10_000 });
     await otherPage.close();
     await page.bringToFront();
-    await page.waitForFunction(() => document.visibilityState === 'visible');
+    await page.waitForFunction(() => document.visibilityState === 'visible', undefined, { polling: 100, timeout: 10_000 });
     assert.equal((await read()).pointerAnchor, undefined, 'Hiding and reopening the real fixture tab must clear calibration');
     await seed();
     await page.evaluate(() => document.dispatchEvent(new Event('freeze')));

@@ -9,7 +9,7 @@ const messages = [];
 const titles = [];
 let settings = { enabled: true };
 let saveSettings = async (value) => { settings = value; };
-let window = { id: 7, focused: true, incognito: false, left: -1280, top: 40, width: 1200, height: 800, state: 'normal', tabs: [{ id: 4, active: true, incognito: false, status: 'complete', url: 'https://example.com/settings' }] };
+let window = { id: 7, focused: true, incognito: false, left: -1280, top: 40, width: 1200, height: 800, state: 'normal', tabs: [{ id: 4, active: true, incognito: false, status: 'complete', url: 'https://example.com/settings', title: 'Tab Settings' }] };
 let injected = async () => [{ frameId: 0, result: { url: 'https://example.com/settings', title: 'Settings', viewport: { width: 1160, height: 700 }, scroll: { x: 0, y: 200 }, devicePixelRatio: 2, visualViewport: { scale: 1, offsetLeft: 0, offsetTop: 0 } } }];
 let reads = 0;
 const connections = [];
@@ -46,6 +46,9 @@ vm.runInContext(source, sandbox);
   assert.equal(messages[0].type, 'enabled');
   assert.equal(messages[0].enabled, true);
   assert.equal(messages.at(-1).available, true);
+  assert.equal(messages.at(-1).pageAvailable, true);
+  assert.equal(messages.at(-1).pageUnavailableReason, undefined);
+  assert.equal(messages.at(-1).title, 'Tab Settings', 'Titles must come from the current tab');
   assert.equal(messages.at(-1).window.left, -1280);
   assert.equal(messages.at(-1).zoom, 1.25);
   assert.equal(titles.at(-1), 'I Know It! — On');
@@ -171,12 +174,15 @@ vm.runInContext(source, sandbox);
   injected = async () => { throw new Error('Restricted page'); };
   await connection.onMessage.emit({ type: 'request-context', requestId: 'restricted' });
   await pause();
-  assert.equal(messages.at(-1).available, false);
-  assert.equal(messages.at(-1).url, undefined);
+  assert.equal(messages.at(-1).available, true);
+  assert.equal(messages.at(-1).pageAvailable, false);
+  assert.equal(messages.at(-1).pageUnavailableReason, 'page-read-failed');
+  assert.equal(messages.at(-1).url, window.tabs[0].url);
+  assert.equal(messages.at(-1).title, window.tabs[0].title);
   const getWindow = chrome.windows.getLastFocused;
   const getZoom = chrome.tabs.getZoom;
   const originalWindow = structuredClone(window);
-  for (const failure of ['window-read', 'no-active-tab', 'closed-window', 'zoom', 'script', 'same-tab-navigation', 'current-incognito', 'current-tab-incognito']) {
+  for (const failure of ['window-read', 'no-active-tab', 'closed-window', 'same-tab-navigation', 'current-incognito', 'current-tab-incognito', 'current-unfocused', 'current-window-id', 'current-window-bounds', 'current-loading', 'missing-main-frame', 'page-url-mismatch']) {
     window = structuredClone(originalWindow);
     chrome.windows.getLastFocused = getWindow;
     chrome.tabs.getZoom = getZoom;
@@ -184,11 +190,15 @@ vm.runInContext(source, sandbox);
     if (failure === 'window-read') chrome.windows.getLastFocused = async () => { throw new Error('Window unavailable'); };
     if (failure === 'no-active-tab') window.tabs = [];
     if (failure === 'closed-window') window = undefined;
-    if (failure === 'zoom') chrome.tabs.getZoom = async () => { throw new Error('Tab closed'); };
-    if (failure === 'script') injected = async () => { throw new Error('Cannot access page'); };
     if (failure === 'same-tab-navigation') injected = async () => { const result = await normalInjection(); window.tabs[0].url = 'https://example.com/next'; return result; };
     if (failure === 'current-incognito') injected = async () => { const result = await normalInjection(); window.incognito = true; return result; };
     if (failure === 'current-tab-incognito') injected = async () => { const result = await normalInjection(); window.tabs[0].incognito = true; return result; };
+    if (failure === 'current-unfocused') injected = async () => { const result = await normalInjection(); window.focused = false; return result; };
+    if (failure === 'current-window-id') injected = async () => { const result = await normalInjection(); window.id++; return result; };
+    if (failure === 'current-window-bounds') injected = async () => { const result = await normalInjection(); window.width++; return result; };
+    if (failure === 'current-loading') injected = async () => { const result = await normalInjection(); window.tabs[0].status = 'loading'; return result; };
+    if (failure === 'missing-main-frame') injected = async () => [{ frameId: 1, result: (await normalInjection())[0].result }];
+    if (failure === 'page-url-mismatch') injected = async () => [{ frameId: 0, result: { ...(await normalInjection())[0].result, url: 'https://example.com/unrelated' } }];
     await connection.onMessage.emit({ type: 'request-context', requestId: failure });
     await pause();
     const reply = messages.find(message => message.requestId === failure);
@@ -196,6 +206,119 @@ vm.runInContext(source, sandbox);
     for (const field of ['url', 'title', 'viewport', 'scroll', 'devicePixelRatio', 'zoom', 'visualViewport']) {
       assert.equal(reply[field], undefined, `${failure} must omit ${field}`);
     }
+  }
+  chrome.windows.getLastFocused = getWindow;
+  for (const failure of ['zoom', 'script', 'script-and-zoom']) {
+    window = structuredClone(originalWindow);
+    chrome.tabs.getZoom = getZoom;
+    injected = normalInjection;
+    if (failure.includes('zoom')) chrome.tabs.getZoom = async () => { throw new Error('Zoom unavailable'); };
+    if (failure.includes('script')) injected = async () => { throw new Error('Cannot access page'); };
+    await connection.onMessage.emit({ type: 'request-context', requestId: `fallback-${failure}` });
+    await pause();
+    const reply = messages.find(message => message.requestId === `fallback-${failure}`);
+    assert.equal(reply.available, true, failure);
+    assert.equal(reply.url, window.tabs[0].url, failure);
+    assert.equal(reply.title, window.tabs[0].title, failure);
+    assert.equal(reply.window.left, window.left, failure);
+    assert.equal(reply.pageAvailable, failure === 'zoom', failure);
+    assert.equal(reply.zoom, failure.includes('zoom') ? undefined : 1.25, failure);
+    if (failure === 'zoom') assert.equal(reply.viewport.width, 1160);
+    else {
+      assert.equal(reply.pageUnavailableReason, 'page-read-failed', failure);
+      for (const field of ['viewport', 'scroll', 'devicePixelRatio', 'visualViewport']) {
+        assert.equal(reply[field], undefined, `${failure} must omit ${field}`);
+      }
+    }
+  }
+  window = structuredClone(originalWindow);
+  window.tabs[0].url = 'chrome://extensions/';
+  window.tabs[0].title = 'Extensions';
+  const internalWindow = structuredClone(window);
+  const beforeInternalReads = reads;
+  for (const zoomAvailable of [true, false]) {
+    chrome.tabs.getZoom = zoomAvailable ? getZoom : async () => { throw new Error('Internal page has no zoom'); };
+    await connection.onMessage.emit({ type: 'request-context', requestId: `internal-${zoomAvailable}` });
+    await pause();
+    const reply = messages.find(message => message.requestId === `internal-${zoomAvailable}`);
+    assert.equal(reply.available, true);
+    assert.equal(reply.pageAvailable, false);
+    assert.equal(reply.pageUnavailableReason, 'browser-internal-page');
+    assert.equal(reply.url, 'chrome://extensions/');
+    assert.equal(reply.title, 'Extensions');
+    assert.equal(reply.window.left, -1280);
+    assert.equal(reply.zoom, zoomAvailable ? 1.25 : undefined);
+    for (const field of ['viewport', 'scroll', 'devicePixelRatio', 'visualViewport']) assert.equal(reply[field], undefined);
+    assert.equal(reads, beforeInternalReads, 'Internal pages must never receive script injection');
+  }
+  for (const race of ['navigation', 'tab-change', 'tab-closed', 'window-closed', 'focus', 'window-change', 'bounds', 'loading', 'incognito', 'tab-incognito']) {
+    window = structuredClone(internalWindow);
+    chrome.tabs.getZoom = async () => {
+      if (race === 'navigation') window.tabs[0].url = 'chrome://settings/';
+      if (race === 'tab-change') window.tabs[0].id++;
+      if (race === 'tab-closed') window.tabs = [];
+      if (race === 'window-closed') window = undefined;
+      if (race === 'focus') window.focused = false;
+      if (race === 'window-change') window.id++;
+      if (race === 'bounds') window.top++;
+      if (race === 'loading') window.tabs[0].status = 'loading';
+      if (race === 'incognito') window.incognito = true;
+      if (race === 'tab-incognito') window.tabs[0].incognito = true;
+      throw new Error('Zoom unavailable during a transition');
+    };
+    await connection.onMessage.emit({ type: 'request-context', requestId: `internal-race-${race}` });
+    await pause();
+    const reply = messages.find(message => message.requestId === `internal-race-${race}`);
+    assert.equal(reply.available, false, race);
+    assert.equal(reply.url, undefined, race);
+    assert.equal(reply.title, undefined, race);
+    assert.equal(reads, beforeInternalReads);
+  }
+  window = structuredClone(internalWindow);
+  let completeZoom;
+  chrome.tabs.getZoom = () => new Promise(resolve => { completeZoom = resolve; });
+  await connection.onMessage.emit({ type: 'request-context', requestId: 'internal-revision' });
+  await pause();
+  assert.equal(typeof completeZoom, 'function');
+  chrome.tabs.getZoom = getZoom;
+  await chrome.windows.onBoundsChanged.emit();
+  completeZoom(1);
+  await pause();
+  const invalidatedInternal = messages.find(message => message.requestId === 'internal-revision');
+  assert.equal(invalidatedInternal.available, false, 'Internal page reads must respect revision invalidation');
+  assert.equal(invalidatedInternal.url, undefined);
+  for (const url of ['http://example.com/', 'https://example.com/', 'chrome://settings/',
+    'file:///private/example.html', 'ftp://example.com/', 'data:text/html,secret', 'blob:https://example.com/id',
+    'javascript:secret()', 'chrome-extension://other-extension/popup.html', 'devtools://devtools/', 'about:blank', '', undefined]) {
+    window = structuredClone(originalWindow);
+    window.tabs[0].url = url;
+    injected = async () => [{ frameId: 0, result: { ...(await normalInjection())[0].result, url } }];
+    const before = reads;
+    let zoomReads = 0;
+    chrome.tabs.getZoom = async () => { zoomReads++; return 1; };
+    await connection.onMessage.emit({ type: 'request-context', requestId: `scheme-${url}` });
+    await pause();
+    const reply = messages.find(message => message.requestId === `scheme-${url}`);
+    const supported = ['http://example.com/', 'https://example.com/', 'chrome://settings/'].includes(url);
+    assert.equal(reply.available, supported, `${url}`);
+    assert.equal(reply.url, supported ? url : undefined, `${url}`);
+    assert.equal(zoomReads, supported ? 1 : 0, `${url}`);
+    assert.equal(reads - before, /^https?:/.test(url ?? '') ? 1 : 0, `${url}`);
+    if (!supported) assert.equal(reply.title, undefined, `${url}`);
+  }
+  for (const privacy of ['window', 'tab']) {
+    window = structuredClone(internalWindow);
+    if (privacy === 'window') window.incognito = true;
+    else window.tabs[0].incognito = true;
+    let zoomReads = 0;
+    chrome.tabs.getZoom = async () => { zoomReads++; return 1; };
+    await connection.onMessage.emit({ type: 'request-context', requestId: `private-internal-${privacy}` });
+    await pause();
+    const reply = messages.find(message => message.requestId === `private-internal-${privacy}`);
+    assert.equal(reply.available, false);
+    assert.equal(reply.url, undefined);
+    assert.equal(reply.title, undefined);
+    assert.equal(zoomReads, 0);
   }
   window = originalWindow;
   chrome.windows.getLastFocused = getWindow;
@@ -340,5 +463,5 @@ vm.runInContext(source, sandbox);
   contentChrome.runtime.sendMessage = () => { throw new Error('Extension context invalidated'); };
   page.y++;
   assert.doesNotThrow(() => handlers['window:scroll'](), 'An unloaded extension must not throw errors into the page');
-  console.log('PASS: fresh/correlated context; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
+  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -63,7 +63,7 @@ function frame(value) {
 }
 const results = [];
 (async () => {
-  for (const mode of ['EOF', 'SIGTERM', 'SIGINT', 'malformed-frame', 'OFF', 'newer-copy', 'broken-pipe', 'second-owner']) {
+  for (const mode of ['EOF', 'SIGTERM', 'SIGINT', 'malformed-frame', 'OFF', 'newer-copy', 'broken-pipe', 'second-owner', 'browser-internal-page']) {
     const name = `com.iknowit.process-test.${crypto.randomUUID()}`;
     const folder = path.join(output, mode); fs.mkdirSync(folder, { recursive: true });
     const app = path.join(folder, 'app'); fs.writeFileSync(app, 'com.google.Chrome');
@@ -99,12 +99,23 @@ const results = [];
         await until(() => ended, 'broken stdout exits');
         assert.equal(state().png, originalPNG);
       } else {
-        child.stdin.write(frame({ type: 'browser-context', requestId, available: true, window: { focused: true }, url: 'https://example.invalid/process-fixture', observedAt: new Date().toISOString() }));
+        const internal = mode === 'browser-internal-page';
+        const url = internal ? 'chrome://extensions/' : 'https://example.invalid/process-fixture';
+        child.stdin.write(frame({ type: 'browser-context', requestId, available: true, pageAvailable: !internal,
+          ...(internal && { pageUnavailableReason: 'browser-internal-page' }),
+          window: { focused: true, left: -1200, top: 40, width: 1200, height: 800 },
+          url, title: internal ? 'Extensions' : 'Process fixture', observedAt: new Date().toISOString() }));
         fs.writeFileSync(app, 'com.openai.codex');
         await until(() => state().files.length === 2, `${mode}: image and Markdown prepared`);
         const files = state().files.map(url => new URL(url));
         assert.equal(fs.readFileSync(files[0]).toString('base64'), originalPNG);
-        assert(fs.readFileSync(files[1], 'utf8').includes('https://example.invalid/process-fixture'));
+        const markdown = fs.readFileSync(files[1], 'utf8');
+        assert(markdown.includes(url));
+        if (internal) {
+          assert(markdown.includes('Extensions') && markdown.includes('-1200'));
+          assert(markdown.includes('Page measurements: unavailable (browser-internal page)'));
+          assert(!markdown.includes('Viewport (CSS px)') && markdown.includes('Screenshot source and crop origin: unknown'));
+        }
         for (const file of files) assert.equal(fs.statSync(file).mode & 0o777, 0o600);
         if (mode === 'second-owner') {
           const second = cp.spawnSync(host, args, { timeout: 3000, input: '', encoding: 'utf8' });
@@ -116,7 +127,7 @@ const results = [];
           await until(() => messages.some(m => m.type === 'test-enabled' && !m.enabled), 'disabled acknowledgement');
           assert.equal(state().png, originalPNG); child.stdin.end();
         } else if (mode === 'newer-copy') { state('text'); child.kill('SIGTERM'); }
-        else if (mode === 'EOF') child.stdin.end();
+        else if (mode === 'EOF' || internal) child.stdin.end();
         else if (mode === 'malformed-frame') child.stdin.write(Buffer.from([0, 0, 0, 0]));
         else child.kill(mode);
         await until(() => ended, `${mode}: process exits`);

@@ -24,7 +24,7 @@ With the switch **OFF**, the companion stops handling images and restores any cl
 
 ## What the context means
 
-The Markdown contains the image's pixel dimensions, the time the clipboard image was observed, and the foreground app observed then. If that app is Chrome and its page can be read, it also includes the observed URL, title, viewport, scroll position, browser window bounds, zoom, and device pixel ratio.
+The Markdown contains the image's pixel dimensions, the time the clipboard image was observed, and the foreground app observed then. If that app is Chrome and the active tab and window can be revalidated, it also includes the observed URL, title, tab/window IDs, and browser window bounds. These basic observations remain available for Chrome internal pages such as `chrome://extensions/`, without injecting a script. Viewport, scroll position, and device pixel ratio require a readable web page; browser zoom is included when available. Missing page measurements are stated separately instead of discarding readable tab information.
 
 These are **observations, not verified screenshot provenance**. An ordinary clipboard image does not reveal where it was captured. A copied old image, a delayed screenshot tool, a background window, or a rapid app switch can make the observed app/page differ from the actual source. The screenshot's desktop position and crop origin remain **unknown**. Agents must not treat browser window bounds as a screenshot-to-desktop coordinate transform.
 
@@ -34,7 +34,7 @@ Full-screen and region images retain their size; they are not stretched to a sta
 
 - A 50 ms clipboard check and app-activation event keep the process passive. An immediate paste before detection can contain only the original image. A late browser response updates the context file, but cannot update a file an agent has already read.
 - Chrome must remain running. One Chrome profile owns the companion at a time; use the toolbar switch in that profile. Multiple simultaneous Chrome profiles are not supported.
-- Incognito, browser-internal pages, inaccessible pages, and uncertain page/focus transitions do not receive page attribution. DOM content and cross-origin iframe contents are not collected.
+- Incognito, unsupported URL schemes, and uncertain page/focus transitions do not receive tab attribution. Chrome internal pages and web pages that deny script access can still provide basic tab/window observations after revalidation, but no page measurements. DOM content and cross-origin iframe contents are not collected.
 - Images above 100 MB, 64 million pixels, or 32,768 pixels on either axis, animated images, concealed/transient clipboard items, and multiple clipboard items pass through unchanged. This may exclude exceptionally large multi-monitor captures.
 - Disk failures preserve ordinary paste. Normal disconnect and termination restore owned content. A forced kill or process crash can leave the two generated file references on the clipboard; copying again replaces them.
 - macOS spaces, physical monitor switching, third-party screenshot tools, and the real native Codex composer remain unverified. Windows, Linux, remote agents, and Claude Code are not supported by this companion.

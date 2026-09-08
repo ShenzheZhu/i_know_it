@@ -124,8 +124,16 @@ final class Bridge {
         if message["available"] as? Bool == true, browserApps.contains(observedApp ?? ""),
            let window = message["window"] as? [String: Any], window["focused"] as? Bool == true,
            let url = message["url"] as? String, url.count <= 16_384,
-           let parsed = URL(string: url), ["http", "https"].contains(parsed.scheme ?? "") {
+           let parsed = URL(string: url), ["http", "https", "chrome"].contains(parsed.scheme ?? ""),
+           let host = parsed.host, !host.isEmpty {
             browser = message
+            if parsed.scheme == "chrome" {
+                browser?["pageAvailable"] = false
+                browser?["pageUnavailableReason"] = "browser-internal-page"
+            }
+            if browser?["pageAvailable"] as? Bool == false {
+                for key in ["viewport", "scroll", "visualViewport", "devicePixelRatio"] { browser?[key] = nil }
+            }
             // Do not delay paste for the browser; update a prepared context file when its reply arrives.
             if let md = files?.last, let image = original { try? writeMarkdown(image, to: md) }
         }
@@ -142,7 +150,7 @@ final class Bridge {
             "- Screenshot source and crop origin: unknown. Foreground observations do not prove where an image was captured."
         ]
         if let browser {
-            lines += ["", "## Browser context observed after the clipboard changed"]
+            lines += ["", "## Browser tab observed after the clipboard changed"]
             for (label, key) in [("Page URL", "url"), ("Page title", "title"), ("Observed at", "observedAt")] {
                 if let value = browser[key] as? String { lines.append("- \(label): \(quoted(String(value.prefix(16_384))))") }
             }
@@ -152,8 +160,12 @@ final class Bridge {
                     lines.append("- \(label): \(text)")
                 }
             }
-            for key in ["zoom", "devicePixelRatio"] {
+            for key in ["windowId", "tabId", "zoom", "devicePixelRatio"] {
                 if let number = browser[key] as? NSNumber { lines.append("- \(key): \(number)") }
+            }
+            if browser["pageAvailable"] as? Bool == false {
+                let reason = browser["pageUnavailableReason"] as? String == "browser-internal-page" ? "browser-internal page" : "page could not be read"
+                lines.append("- Page measurements: unavailable (\(reason)); viewport and scroll were not read.")
             }
             lines += ["", "This is observed browser context, not verified image provenance. Re-observe the page before clicking; these values are not desktop click coordinates."]
         } else { lines.append("- Browser context: unavailable; no page attribution is inferred.") }
@@ -394,6 +406,25 @@ func selfTest() throws {
     board.clearContents(); bridge.tick(); board.setString("delayed text", forType: .string)
     app = "com.openai.codex"; bridge.tick()
     assert(board.string(forType: .string) == "delayed text" && bridge.original == nil)
+
+    // Basic tab/window metadata remains useful when Chrome forbids page script injection.
+    for (url, reason) in [("chrome://extensions/", "browser-internal-page"), ("https://example.com/restricted", "page-read-failed")] {
+        app = "com.google.Chrome"; putImage(); bridge.tick()
+        bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
+                        "pageAvailable": false, "pageUnavailableReason": reason, "url": url, "title": "Observed tab",
+                        "viewport": ["width": 999], "scroll": ["y": 999], "devicePixelRatio": 2,
+                        "window": ["focused": true, "left": -1200, "top": 40, "width": 1200, "height": 800]])
+        let partial = bridge.markdown(bridge.original!)
+        assert(partial.contains(quoted(url)) && partial.contains("Observed tab") && partial.contains("-1200"))
+        assert(partial.contains("Page measurements: unavailable") && !partial.contains("Viewport (CSS px)"))
+        assert(partial.contains("Screenshot source and crop origin: unknown"))
+    }
+    for url in ["file:///private/screenshot.png", "javascript:alert(1)", "data:text/html,private", "chrome:extensions"] {
+        app = "com.google.Chrome"; putImage(); bridge.tick()
+        bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
+                        "url": url, "window": ["focused": true]])
+        assert(bridge.browser == nil, "Unsupported or malformed browser URL was accepted")
+    }
 
     bitmap.setColor(NSColor(deviceRed: 1, green: 0, blue: 0, alpha: 1), atX: 0, y: 0)
     let variants = [png, bitmap.representation(using: .png, properties: [:])!]

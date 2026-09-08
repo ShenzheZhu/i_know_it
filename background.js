@@ -40,24 +40,34 @@ async function readContext(version, requestId) {
     const tab = window.tabs?.find((item) => item.active);
     context = unavailable(window, tab?.id);
     if (window.focused && !window.incognito && tab && !tab.incognito
-      && tab.status === 'complete' && /^https?:\/\//.test(tab.url ?? '')) {
+      && tab.status === 'complete' && /^(?:https?|chrome):\/\//.test(tab.url ?? '')) {
       const observedAt = new Date().toISOString();
-      const [results, zoom] = await Promise.all([
-        chrome.scripting.executeScript({ target: { tabId: tab.id }, func: pageContext }),
+      const internalPage = tab.url.startsWith('chrome://');
+      const [script, scale] = await Promise.allSettled([
+        internalPage ? Promise.resolve([])
+          : chrome.scripting.executeScript({ target: { tabId: tab.id }, func: pageContext }),
         chrome.tabs.getZoom(tab.id),
       ]);
       const current = await chrome.windows.getLastFocused({ populate: true });
       const active = current.tabs?.find((item) => item.active);
-      const page = results.find((item) => item.frameId === 0)?.result;
+      const page = script.status === 'fulfilled' && Array.isArray(script.value)
+        ? script.value.find((item) => item.frameId === 0)?.result : undefined;
       if (current.focused && !current.incognito && current.id === window.id && active?.id === tab.id
-        && !active.incognito && active.status === 'complete' && active.url === tab.url && page?.url === tab.url
+        && !active.incognito && active.status === 'complete' && active.url === tab.url
+        && (internalPage || script.status === 'rejected' || page?.url === tab.url)
         && ['left', 'top', 'width', 'height', 'state'].every((key) => current[key] === window[key])) {
-        context = { ...context, ...page, observedAt, available: true, zoom };
+        const pageAvailable = !internalPage && page?.url === active.url;
+        context = {
+          ...context, ...(pageAvailable && page), observedAt, available: true,
+          url: active.url, title: active.title, pageAvailable,
+          ...(!pageAvailable && { pageUnavailableReason: internalPage ? 'browser-internal-page' : 'page-read-failed' }),
+          ...(scale.status === 'fulfilled' && { zoom: scale.value }),
+        };
       } else {
         context = unavailable(current, active?.id);
       }
     }
-  } catch { /* Restricted pages and closing tabs have no page context. */ }
+  } catch { /* Unverifiable windows and closing tabs have no browser context. */ }
   if (port !== recipient) return;
   if (requestId) {
     send({ ...(enabled && version === revision ? context : unavailable()), requestId });

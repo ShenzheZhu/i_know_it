@@ -34,7 +34,11 @@ if operation == "release" { board.releaseGlobally(); exit(0) }
 if operation == "image" {
  let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 6, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
  bitmap.bitmapData!.initialize(repeating: 127, count: bitmap.bytesPerRow * bitmap.pixelsHigh)
- board.clearContents(); board.setData(bitmap.representation(using: .png, properties: [:])!, forType: .png)
+ let png = bitmap.representation(using: .png, properties: [:])!
+ board.clearContents()
+ // Deterministically expose a polling tick between clearing and supplying the image.
+ Thread.sleep(forTimeInterval: 0.20)
+ board.setData(png, forType: .png)
 }
 if operation == "text" { board.clearContents(); board.setString("new user copy", forType: .string) }
 let entries = board.pasteboardItems ?? []

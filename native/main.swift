@@ -168,7 +168,10 @@ final class Bridge {
         let count = board.changeCount
         if count != seen {
             // An external copy always replaces our pending work; never restore over a newer copy.
-            owned = nil; ownershipToken = nil; original = nil; files = nil; browser = nil; requestID = nil; seen = count
+            owned = nil; ownershipToken = nil; original = nil; files = nil; browser = nil; requestID = nil
+            // Clearing and filling a pasteboard can share one change count. Wait for its contents.
+            guard let entries = board.pasteboardItems, !entries.isEmpty else { return }
+            seen = count
             guard let image = ClipboardImage(board), board.changeCount == count else { return }
             original = image; observedAt = Date(); observedApp = currentApp()
             if browserApps.contains(observedApp ?? "") {
@@ -381,6 +384,16 @@ func selfTest() throws {
     board.clearContents(); board.setString("copy before duplicate enable", forType: .string)
     bridge.receive(["type": "enabled", "enabled": true]); app = "com.openai.codex"; bridge.tick()
     assert(board.string(forType: .string) == "copy before duplicate enable", "Duplicate enable resurrected an older screenshot")
+
+    // A screenshot writer can clear first, then supply PNG data without another change count.
+    app = "com.google.Chrome"; putImage(); bridge.tick()
+    board.clearContents(); bridge.tick()
+    assert(bridge.original == nil && bridge.requestID == nil)
+    board.setData(png, forType: .png); bridge.tick()
+    assert(bridge.original?.png == png && bridge.requestID != nil, "Delayed clipboard data was skipped")
+    board.clearContents(); bridge.tick(); board.setString("delayed text", forType: .string)
+    app = "com.openai.codex"; bridge.tick()
+    assert(board.string(forType: .string) == "delayed text" && bridge.original == nil)
 
     bitmap.setColor(NSColor(deviceRed: 1, green: 0, blue: 0, alpha: 1), atX: 0, y: 0)
     let variants = [png, bitmap.representation(using: .png, properties: [:])!]

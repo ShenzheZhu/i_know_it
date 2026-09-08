@@ -40,12 +40,16 @@
   chrome.runtime.onMessage.addListener((message, sender) => {
     if (message?.type === 'page-state' && sender.id === chrome.runtime.id && !sender.tab) setEnabled(message.enabled);
   });
-  const initialRevision = stateRevision;
-  try {
-    chrome.runtime.sendMessage({ type: 'get-page-state' }).then(state => {
-      if (stateRevision === initialRevision) setEnabled(state?.enabled);
-    }).catch(() => {});
-  } catch { /* An unavailable extension stays OFF. */ }
+  function readState() {
+    setEnabled(false);
+    const requestedRevision = stateRevision;
+    try {
+      chrome.runtime.sendMessage({ type: 'get-page-state' }).then(state => {
+        if (stateRevision === requestedRevision) setEnabled(state?.enabled);
+      }).catch(() => {});
+    } catch { /* An unavailable extension stays OFF. */ }
+  }
+  readState();
 
   addEventListener('pointermove', event => {
     if (!enabled) return;
@@ -72,9 +76,12 @@
     }
     return page;
   };
-  for (const event of ['scroll', 'resize', 'hashchange', 'popstate', 'pageshow']) {
+  for (const event of ['scroll', 'resize', 'hashchange', 'popstate']) {
     addEventListener(event, report, { passive: true });
   }
+  addEventListener('pageshow', event => { if (event.persisted) readState(); else report(); }, { passive: true });
+  document.addEventListener('freeze', () => setEnabled(false));
+  document.addEventListener('resume', readState);
   document.addEventListener('visibilitychange', report);
   document.addEventListener('fullscreenchange', report);
   visualViewport?.addEventListener('scroll', report, { passive: true });

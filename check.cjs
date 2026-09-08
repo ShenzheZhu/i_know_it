@@ -500,7 +500,15 @@ vm.runInContext(source, sandbox);
     { ...pageSender, tab: { ...pageSender.tab, active: false } },
     { ...pageSender, tab: { ...pageSender.tab, incognito: true } },
   ]) await chrome.runtime.onMessage.emit({ type: 'context-changed', geometryChanged: true }, sender);
-  assert.equal(invalidations(), beforeNonGeometry, 'Focus, title-only changes, inactive tabs, and forged page signals must not invalidate geometry');
+  assert.equal(invalidations(), beforeNonGeometry, 'Same-window focus, title-only changes, inactive tabs, and forged page signals must not invalidate geometry');
+  await chrome.windows.onFocusChanged.emit(window.id + 1);
+  assert.equal(invalidations(), beforeNonGeometry + 1, 'Acquiring a different Chrome window must invalidate pending coordinates');
+  for (const focus of [chrome.windows.WINDOW_ID_NONE, window.id + 1, undefined, NaN, -2]) {
+    await chrome.windows.onFocusChanged.emit(focus);
+  }
+  assert.equal(invalidations(), beforeNonGeometry + 1, 'Same-window return, external focus and invalid IDs must not cancel a capture');
+  await chrome.windows.onFocusChanged.emit(window.id);
+  assert.equal(invalidations(), beforeNonGeometry + 2, 'Returning to another Chrome window is another geometry transition');
   await pause();
   const beforeForged = reads;
   await chrome.runtime.onMessage.emit({ type: 'context-changed' }, { id: 'other-extension', frameId: 0, tab: { active: true }, url: 'https://example.com/' });
@@ -741,6 +749,57 @@ vm.runInContext(source, sandbox);
   assert.equal(extracted.pointerAnchor.screen.x, -1179.75, 'Background extraction must call the isolated page context function');
   assert.equal(extracted.pageWindow.screenX, -1280);
   delete sandbox.__iKnowItPageContext;
+  const livePageState = value => contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: value }, { id: chrome.runtime.id });
+  const beforeOrdinaryPageShow = stateRequests.length;
+  handlers['window:pageshow']({ persisted: false });
+  assert.equal(stateRequests.length, beforeOrdinaryPageShow, 'An ordinary pageshow must not repeat initial state initialization');
+  assert(readPage().pointerAnchor);
+  for (const [lifecycle, state] of [['bfcache', false], ['resume', false], ['bfcache', undefined]]) {
+    await livePageState(true); move();
+    assert(readPage().pointerAnchor);
+    const beforeSuspend = contentMessages.length;
+    handlers['document:freeze']();
+    page.y++; interval(); move();
+    assert.equal(readPage().pointerAnchor, undefined, 'Freezing must clear the anchor and stop collection');
+    assert.equal(contentMessages.length, beforeSuspend, 'A frozen page must stay silent');
+    // The worker switched OFF while this document could not receive page-state updates.
+    const beforeRestore = stateRequests.length;
+    if (lifecycle === 'bfcache') handlers['window:pageshow']({ persisted: true });
+    else handlers['document:resume']();
+    assert.equal(stateRequests.length, beforeRestore + 1, 'Restoration must request authoritative current state');
+    move(); interval();
+    assert.equal(readPage().pointerAnchor, undefined, 'A missing restore reply must leave reporting OFF');
+    assert.equal(contentMessages.length, beforeSuspend, 'Restoration must not report using the pre-freeze ON state');
+    resolveInitialState(state === undefined ? undefined : { enabled: state });
+    await Promise.resolve(); move();
+    assert.equal(readPage().pointerAnchor, undefined, 'Authoritative OFF or absent state must keep the restored page OFF');
+  }
+  for (const live of [false, true]) {
+    handlers['window:pageshow']({ persisted: true });
+    const staleReply = resolveInitialState;
+    await livePageState(live);
+    if (live) move();
+    staleReply({ enabled: !live });
+    await Promise.resolve(); move();
+    assert.equal(!!readPage().pointerAnchor, live, 'A delayed restore reply must not override a newer live toggle');
+  }
+  handlers['document:freeze']();
+  handlers['document:resume']();
+  const olderResumeReply = resolveInitialState;
+  handlers['window:pageshow']({ persisted: true });
+  const newerRestoreReply = resolveInitialState;
+  olderResumeReply({ enabled: true });
+  await Promise.resolve(); move();
+  assert.equal(readPage().pointerAnchor, undefined, 'An older resume reply must not enable a newer pending BFCache restoration');
+  newerRestoreReply({ enabled: false });
+  await Promise.resolve();
+  handlers['document:resume']();
+  const preFreezeReply = resolveInitialState;
+  handlers['document:freeze']();
+  preFreezeReply({ enabled: true });
+  await Promise.resolve(); move();
+  assert.equal(readPage().pointerAnchor, undefined, 'Freezing again must invalidate an outstanding state reply');
+  await livePageState(true); move();
   contentChrome.runtime.sendMessage = () => { throw new Error('Extension context invalidated'); };
   page.y++;
   assert.doesNotThrow(() => handlers['window:scroll'](), 'An unloaded extension must not throw errors into the page');
@@ -760,5 +819,5 @@ vm.runInContext(source, sandbox);
     assert.equal(startupSignals.length, initialState === true ? 1 : 0,
       'Only an authoritative initial ON reply may enable page reporting');
   }
-  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; authoritative page state and failed-storage toggle propagation; trusted/recent/fractional pointer anchors, stale/synthetic/hidden/OFF/geometry rejection; metadata-only signals without DOM writes; geometry invalidation without focus-only cancellation; forged/iframe messages rejected.');
+  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; authoritative page state and failed-storage toggle propagation; trusted/recent/fractional pointer anchors, stale/synthetic/hidden/OFF/geometry rejection; metadata-only signals without DOM writes; geometry invalidation on different Chrome windows without same-window focus cancellation; authoritative BFCache/resume state, freeze clearing and stale-reply isolation; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

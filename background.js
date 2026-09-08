@@ -5,6 +5,7 @@ let revision = 0;
 let inputStatus = 'disconnected';
 let permissionReturn;
 let reconnectTimer;
+let lastFocusedWindowId;
 const state = () => ({ enabled, inputStatus });
 
 function updateInputStatus(status) {
@@ -63,6 +64,9 @@ async function readContext(version, requestId) {
   try {
     if (!enabled) throw new Error('Disabled');
     const window = await chrome.windows.getLastFocused({ populate: true });
+    if (lastFocusedWindowId === undefined && Number.isInteger(window?.id) && window.id >= 0) {
+      lastFocusedWindowId = window.id;
+    }
     const tab = window.tabs?.find((item) => item.active);
     context = unavailable(window, tab?.id);
     if (window.focused && !window.incognito && tab && !tab.incognito
@@ -179,6 +183,10 @@ chrome.tabs.onUpdated.addListener((_id, changes, tab) => {
 });
 chrome.tabs.onZoomChange.addListener(() => { invalidateGeometry(); refresh(); });
 chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (Number.isInteger(windowId) && windowId >= 0) {
+    if (lastFocusedWindowId !== undefined && lastFocusedWindowId !== windowId) invalidateGeometry();
+    lastFocusedWindowId = windowId;
+  }
   if (permissionReturn && enabled && port) {
     if (windowId === chrome.windows.WINDOW_ID_NONE) permissionReturn.blurred = true;
     else if (Number.isInteger(windowId) && windowId >= 0 && permissionReturn.blurred) {

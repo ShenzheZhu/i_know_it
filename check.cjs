@@ -629,7 +629,7 @@ vm.runInContext(source, sandbox);
   assert.deepEqual(Object.keys(contentMessages[0]), ['type', 'geometryChanged'], 'Only a geometry change signal should leave the content script');
   assert.equal(contentMessages[0].geometryChanged, true);
   interval();
-  handlers['window:scroll']();
+  interval();
   assert.equal(contentMessages.length, 1, 'Unchanged metadata should not produce duplicate signals');
   page.y = 600;
   handlers['window:scroll']({ preventDefault() { assert.fail('Do not cancel scrolling'); } });
@@ -669,14 +669,22 @@ vm.runInContext(source, sandbox);
   assert.deepEqual(JSON.parse(JSON.stringify(anchor.client)), { x: 100.25, y: 20.5 });
   assert.equal(anchor.ageMs, 0);
   assert(Number.isFinite(Date.parse(anchor.observedAt)));
-  now = 2000;
-  assert.equal(readPage().pointerAnchor.ageMs, 1000, 'The one-second anchor boundary is inclusive');
-  now = 2000.25;
-  assert.equal(readPage().pointerAnchor, undefined, 'A stale anchor must not leave the page');
-  restorePage(); move(); now = 999.75;
-  assert.equal(readPage().pointerAnchor, undefined, 'A clock reversal must not expose an anchor');
+  for (const ageMs of [1000, 1000.25, 60_000, 600_000]) {
+    now = 1000 + ageMs; interval();
+    const stationary = readPage().pointerAnchor;
+    assert.deepEqual(JSON.parse(JSON.stringify(stationary)), { ...JSON.parse(JSON.stringify(anchor)), ageMs },
+      'A stationary calibration retains its original coordinates and timestamp, with its actual age');
+  }
+  for (const invalidNow of [999.75, NaN, Infinity, -Infinity]) {
+    restorePage(); move(); now = invalidNow;
+    assert.equal(readPage().pointerAnchor, undefined, 'An invalid calibration age must not leave the page');
+    now = 1000;
+    assert.equal(readPage().pointerAnchor, undefined, 'Restoring the clock must not revive a rejected calibration');
+  }
   restorePage(); move(); page.focused = false;
-  assert(readPage().pointerAnchor, 'Focus loss alone during the system screenshot overlay must retain a recent anchor');
+  assert(readPage().pointerAnchor, 'Focus loss alone during the system screenshot overlay must retain a stable calibration');
+  move({ screenX: 999, clientX: 500 });
+  assert.equal(readPage().pointerAnchor.screen.x, -1179.75, 'An unfocused event cannot replace a valid calibration');
   assert.equal(handlers['window:blur'], undefined);
   assert.equal(handlers['window:focus'], undefined);
   restorePage();
@@ -687,19 +695,27 @@ vm.runInContext(source, sandbox);
     { timeStamp: 899.75 }, { timeStamp: 1000.25 }, { timeStamp: NaN },
     { screenX: Infinity }, { screenY: NaN }, { clientX: -Infinity }, { clientY: NaN },
   ]) {
-    move(); assert(readPage().pointerAnchor);
+    handlers['window:resize']();
     move(invalid);
-    assert.equal(readPage().pointerAnchor, undefined, `Reject invalid pointer observation ${JSON.stringify(invalid)}`);
+    assert.equal(readPage().pointerAnchor, undefined, `An ineligible event cannot seed a calibration ${JSON.stringify(invalid)}`);
+    move(); const prior = JSON.stringify(readPage().pointerAnchor);
+    move(invalid);
+    assert.equal(JSON.stringify(readPage().pointerAnchor), prior, `An ineligible event must not replace a valid calibration ${JSON.stringify(invalid)}`);
   }
-  for (const invalid of ['hidden', 'unfocused', 'pointer-lock', 'invalid-clock']) {
+  for (const invalid of ['hidden', 'pointer-lock', 'invalid-clock']) {
     restorePage(); move();
     if (invalid === 'hidden') page.visibility = 'hidden';
-    if (invalid === 'unfocused') page.focused = false;
     if (invalid === 'pointer-lock') page.pointerLock = true;
     if (invalid === 'invalid-clock') now = NaN;
     move();
     assert.equal(readPage().pointerAnchor, undefined, invalid);
+    restorePage();
+    assert.equal(readPage().pointerAnchor, undefined, 'Leaving an invalidating state must not revive its calibration');
   }
+  restorePage(); move(); page.pointerLock = true;
+  assert.equal(readPage().pointerAnchor, undefined, 'The getter rejects pointer lock before its event callback');
+  page.pointerLock = false;
+  assert.equal(readPage().pointerAnchor, undefined, 'Unlocking without an event must not revive the rejected calibration');
   restorePage(); move({ timeStamp: 900 });
   assert.equal(readPage().pointerAnchor.ageMs, 100, 'A pointer event at the freshness boundary is accepted');
 
@@ -720,6 +736,27 @@ vm.runInContext(source, sandbox);
     page[key] = old;
     (eventName ? handlers[eventName] : interval)();
     assert.equal(readPage().pointerAnchor, undefined, 'Restoring geometry must not revive an invalidated anchor');
+  }
+  for (const key of ['width', 'screenY', 'ratio']) {
+    move(); const previousValue = page[key];
+    const signalsBefore = contentMessages.length;
+    page[key] += 1;
+    assert.equal(readPage().pointerAnchor, undefined);
+    assert.equal(contentMessages.length, signalsBefore + 1, 'A getter-observed geometry mismatch must invalidate pending native estimates');
+    assert.equal(contentMessages.at(-1).geometryChanged, true);
+    page[key] = previousValue;
+    assert.equal(readPage().pointerAnchor, undefined, 'Getter mismatch followed by restoration without events must not resurrect a calibration');
+  }
+  for (const signal of ['window:resize', 'viewport:resize', 'window:scroll', 'viewport:scroll',
+    'window:hashchange', 'window:popstate', 'document:fullscreenchange', 'document:pointerlockchange']) {
+    move(); assert(readPage().pointerAnchor);
+    const signalsBefore = contentMessages.length;
+    handlers[signal]();
+    assert.equal(readPage().pointerAnchor, undefined, `${signal} must invalidate even when sampled geometry is unchanged`);
+    assert.equal(contentMessages.length, signalsBefore + 1, `${signal} must notify pending native selections`);
+    assert.equal(contentMessages.at(-1).geometryChanged, true);
+    interval();
+    assert.equal(readPage().pointerAnchor, undefined, 'An unchanged later poll must not recreate calibration');
   }
   move(); page.title = 'A title-only update'; interval();
   assert(readPage().pointerAnchor, 'A title-only update must retain its anchor');
@@ -820,5 +857,5 @@ vm.runInContext(source, sandbox);
     assert.equal(startupSignals.length, initialState === true ? 1 : 0,
       'Only an authoritative initial ON reply may enable page reporting');
   }
-  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; authoritative page state and failed-storage toggle propagation; trusted/recent/fractional pointer anchors, stale/synthetic/hidden/OFF/geometry rejection; metadata-only signals without DOM writes; geometry invalidation on different Chrome windows without same-window focus cancellation; authoritative BFCache/resume state, freeze clearing and stale-reply isolation; forged/iframe messages rejected.');
+  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; authoritative page state and failed-storage toggle propagation; trusted/fractional calibration preserved while stationary with original timestamps; ineligible-event seed rejection without replacing valid calibration; invalid-age, hidden, pointer-lock, OFF and geometry clearing without resurrection; equal-size structural signals invalidate pending native estimates; metadata-only signals without DOM writes; geometry invalidation on different Chrome windows without same-window focus cancellation; authoritative BFCache/resume state, freeze clearing and stale-reply isolation; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

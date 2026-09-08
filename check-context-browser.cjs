@@ -72,11 +72,56 @@ const server = http.createServer((_request, response) => {
     assert.equal(initial.url, `${origin}/`);
     assert.equal(initial.viewport.width, 1000);
     assert(initial.pageWindow && typeof initial.fullscreen === 'boolean');
+    await page.waitForTimeout(1250); // Exercise stationary use beyond the former one-second lifetime.
+    const stationary = (await read()).pointerAnchor;
+    assert(stationary && stationary.ageMs > 1000);
+    assert.equal(stationary.observedAt, initial.pointerAnchor.observedAt, 'Reading an old calibration must not fabricate a fresh timestamp');
+    assert.deepEqual(stationary.screen, initial.pointerAnchor.screen);
+    assert.deepEqual(stationary.client, initial.pointerAnchor.client);
+    await page.evaluate(() => dispatchEvent(new PointerEvent('pointermove', {
+      pointerType: 'mouse', buttons: 0, clientX: 500, clientY: 500, screenX: 700, screenY: 700,
+    })));
+    assert.equal((await read()).pointerAnchor.observedAt, initial.pointerAnchor.observedAt, 'A synthetic event cannot replace an existing calibration');
     await page.evaluate(() => { globalThis.__iKnowItPageContext = () => ({ forged: true, pointerAnchor: { client: { x: -999 } } }); });
     const isolated = await read();
     assert.equal(isolated.forged, undefined, 'Main-world code must not replace the isolated getter used by executeScript');
     assert.equal(isolated.pointerAnchor.client.x, 180);
+    const beforeEqualResize = await read();
+    await page.evaluate(() => dispatchEvent(new Event('resize')));
+    const equalResize = await read();
+    assert.deepEqual(equalResize.viewport, beforeEqualResize.viewport);
+    assert.deepEqual(equalResize.pageWindow, beforeEqualResize.pageWindow);
+    assert.equal(equalResize.pointerAnchor, undefined, 'An equal-size resize signal must permanently invalidate calibration');
+    assert.equal((await read()).pointerAnchor, undefined, 'Reading unchanged geometry cannot revive a structurally invalidated calibration');
+    await seed();
+    const restoredGeometry = await worker.evaluate(async id => {
+      const results = await chrome.scripting.executeScript({ target: { tabId: id }, func: () => {
+        // Same-turn fixture navigation avoids event/poll timing: the getter must clear on mismatch itself.
+        const original = location.href;
+        history.replaceState(null, '', `${original}?calibration-drift`);
+        const changed = globalThis.__iKnowItPageContext();
+        history.replaceState(null, '', original);
+        return { changed, restored: globalThis.__iKnowItPageContext() };
+      } });
+      return results.find(result => result.frameId === 0).result;
+    }, tabId);
+    assert.equal(restoredGeometry.changed.pointerAnchor, undefined);
+    assert.equal(restoredGeometry.restored.pointerAnchor, undefined, 'Returning to identical geometry without intervening events cannot resurrect calibration');
+    await seed();
+    await page.mouse.move(-20, -20);
+    const otherPage = await context.newPage();
+    await otherPage.bringToFront();
+    await page.waitForFunction(() => document.visibilityState === 'hidden');
+    await otherPage.close();
+    await page.bringToFront();
+    await page.waitForFunction(() => document.visibilityState === 'visible');
+    assert.equal((await read()).pointerAnchor, undefined, 'Hiding and reopening the real fixture tab must clear calibration');
+    await seed();
+    await page.evaluate(() => document.dispatchEvent(new Event('freeze')));
+    await page.mouse.move(200, 200);
+    assert.equal((await read()).pointerAnchor, undefined, 'A lifecycle freeze signal must stop collection in the isolated script');
     await toggle(false);
+    await page.evaluate(() => document.dispatchEvent(new Event('resume')));
     await page.mouse.move(200, 200);
     assert.equal((await read()).pointerAnchor, undefined, 'OFF must stop collecting anchors');
     await toggle(true);
@@ -100,7 +145,7 @@ const server = http.createServer((_request, response) => {
     assert.equal(await page.evaluate(() => typeof globalThis.__iKnowItPageContext), 'undefined');
     await seed();
     assert.deepEqual(errors, []);
-    console.log('PASS: real Chromium extension isolated world; production background executeScript reads trusted anchors; synthetic input and main-world getter spoofing rejected; OFF/ON, navigation, scroll, and resize invalidation. Native macOS geometry and target-app paste are outside this check.');
+    console.log('PASS: real Chromium extension isolated world; production background executeScript reads trusted calibration beyond one stationary second without renewing timestamps; synthetic input and main-world getter spoofing rejected; equal-size resize and getter mismatch cannot resurrect old calibration; hidden-tab and lifecycle signals, OFF/ON, navigation, scroll, and resize invalidation. Native macOS geometry and target-app paste are outside this check.');
   } finally {
     if (context) await context.close();
     await new Promise(resolve => server.close(resolve));

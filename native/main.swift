@@ -378,7 +378,7 @@ func estimatePageRegion(_ region: RegionObservation, context: GestureContext) ->
           let screen = anchor["screen"] as? [String: Any], let client = anchor["client"] as? [String: Any],
           let screenX = number(screen, "x"), let screenY = number(screen, "y"),
           let clientX = number(client, "x"), let clientY = number(client, "y"),
-          let age = number(anchor, "ageMs"), (0...1000).contains(age),
+          let age = number(anchor, "ageMs"), age >= 0,
           let stamp = anchor["observedAt"] as? String, stamp.count <= 64,
           let viewport = browser["viewport"] as? [String: Any],
           let width = number(viewport, "width"), let height = number(viewport, "height"), width > 0, height > 0,
@@ -404,8 +404,9 @@ func estimatePageRegion(_ region: RegionObservation, context: GestureContext) ->
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let date = formatter.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp)
-    // The reply is accepted within one second of the shortcut; the anchor is at most one second old.
-    guard let date, abs(date.timeIntervalSince(context.date)) <= 2 else { return nil }
+    // A retained calibration keeps its original timestamp and real monotonic age.
+    // Their sum must still agree with the shortcut-time reply, accepted within one second.
+    guard let date, abs(date.timeIntervalSince(context.date) + Double(age) / 1000) <= 2 else { return nil }
     let windowRect = CGRect(x: left, y: top, width: outerWidth, height: outerHeight)
     let origin = CGPoint(x: screenX - clientX * zoom, y: screenY - clientY * zoom)
     let contentRect = CGRect(x: origin.x, y: origin.y, width: width * zoom, height: height * zoom)
@@ -663,13 +664,15 @@ final class Bridge {
                     "- Estimated content viewport origin in global display points: x=\(estimate.origin.x), y=\(estimate.origin.y)",
                     "- Estimated selection in viewport CSS pixels: \(rect(estimate.viewportRect))",
                     "- Estimated selection in top-document CSS pixels: \(rect(estimate.documentRect))",
-                    "- Pointer anchor age at browser observation: \(estimate.anchorAgeMs) ms.",
-                    "- Estimation: recent pointer screen/client observation with browser zoom. Coordinates may be fractional; window agreement allows up to 1 display point of rounding. This estimates the raw drag, not the exact image crop, verified page provenance, or iframe-local coordinates."
+                    "- Retained pointer calibration age at browser observation: \(estimate.anchorAgeMs) ms.",
+                    "- Estimation: retained pointer screen/client calibration with unchanged observed geometry and browser zoom. Unobserved browser-chrome changes may invalidate this estimate. Coordinates may be fractional; window agreement allows up to 1 display point of rounding. This estimates the raw drag, not the exact image crop, verified page provenance, or iframe-local coordinates."
                 ]
             } else {
                 lines.append(context.geometryInvalidated
                     ? "- Web-page CSS coordinates: unknown; browser geometry changed after the screenshot shortcut."
-                    : "- Web-page CSS coordinates: unknown; a fresh, stable pointer observation and unambiguous viewport/display mapping are required.")
+                    : context.browser?["pointerAnchor"] == nil
+                        ? "- Web-page CSS coordinates: unknown; no usable pointer calibration was supplied."
+                        : "- Web-page CSS coordinates: unknown; the supplied calibration failed time, window, zoom, or containment checks. See the browser measurements below.")
             }
             lines.append("- Re-observe the live display before clicking; its layout may have changed.")
         } else if let regionDiagnostic {
@@ -680,7 +683,7 @@ final class Bridge {
             for (label, key) in [("Page URL", "url"), ("Page title", "title"), ("Observed at", "observedAt")] {
                 if let value = browser[key] as? String { lines.append("- \(label): \(quoted(String(value.prefix(16_384))))") }
             }
-            for (label, key) in [("Viewport (CSS px)", "viewport"), ("Scroll (CSS px)", "scroll"), ("Browser window", "window"), ("Visual viewport", "visualViewport")] {
+            for (label, key) in [("Viewport (CSS px)", "viewport"), ("Scroll (CSS px)", "scroll"), ("Browser window", "window"), ("Visual viewport", "visualViewport"), ("Page window", "pageWindow"), ("Pointer calibration", "pointerAnchor")] {
                 if let value = browser[key] as? [String: Any], JSONSerialization.isValidJSONObject(value),
                    let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) {
                     lines.append("- \(label): \(text)")
@@ -689,6 +692,7 @@ final class Bridge {
             for key in ["windowId", "tabId", "zoom", "devicePixelRatio"] {
                 if let number = browser[key] as? NSNumber { lines.append("- \(key): \(number)") }
             }
+            if let fullscreen = browser["fullscreen"] as? Bool { lines.append("- fullscreen: \(fullscreen)") }
             if browser["pageAvailable"] as? Bool == false {
                 let reason = browser["pageUnavailableReason"] as? String == "browser-internal-page" ? "browser-internal page" : "page could not be read"
                 lines.append("- Page measurements: unavailable (\(reason)); viewport and scroll were not read.")
@@ -1263,15 +1267,22 @@ func regionSelfTest() {
     for value: CGFloat in [0.249, 5.001] {
         check(estimatePageRegion(pageRegion(), context: alteredPage(["zoom"], value)) == nil, "unsupported zoom rejected")
     }
-    for value in [0, 1000] {
-        check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "ageMs"], value)) != nil, "inclusive anchor age limits")
+    for seconds: Double in [0, 1, 1.001, 5, 60, 3600, 86400] {
+        var retained = pageContext()
+        retained.browser = replacing(retained.browser!, ["pointerAnchor", "ageMs"], seconds * 1000)
+        retained.browser = replacing(retained.browser!, ["pointerAnchor", "observedAt"], iso(pageDate.addingTimeInterval(-seconds)))
+        let estimate = estimatePageRegion(pageRegion(), context: retained)
+        check(estimate?.origin == CGPoint(x: 140, y: 220), "stationary calibration retains its observed origin without a one-second cutoff")
+        check(estimate?.anchorAgeMs == seconds * 1000, "retained calibration preserves its real age")
+        retained.geometryInvalidated = true
+        check(estimatePageRegion(pageRegion(), context: retained) == nil, "geometry invalidation rejects retained calibration at every age")
     }
-    for value in [-1, 1001] {
-        check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "ageMs"], value)) == nil, "stale or negative anchor age")
+    for value: Double in [-1, 3000, Double.greatestFiniteMagnitude] {
+        check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "ageMs"], value)) == nil, "negative age or inconsistent wall/monotonic time fails closed")
     }
     for value in ["invalid", iso(pageDate.addingTimeInterval(-3)), iso(pageDate.addingTimeInterval(3))] {
         check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "observedAt"], value)) == nil,
-              "malformed, stale and future anchor timestamps rejected")
+              "malformed or age-inconsistent anchor timestamps rejected")
     }
     for (path, value): ([String], Any) in [(["fullscreen"], true), (["window", "state"], "fullscreen"),
         (["visualViewport", "scale"], 1.01), (["visualViewport", "offsetLeft"], 0.1), (["visualViewport", "offsetTop"], -0.1),
@@ -1577,7 +1588,7 @@ func selfTest() throws {
         reply["window"] = ["focused": true, "state": "normal", "left": -90, "top": -40, "width": 450, "height": 350]
         reply["pageWindow"] = ["screenX": -90, "screenY": -40, "outerWidth": 450, "outerHeight": 350]
         reply["pointerAnchor"] = ["screen": ["x": -70, "y": -15], "client": ["x": 20, "y": 10],
-                                  "ageMs": 50, "observedAt": iso(bridge.gestureContext!.date.addingTimeInterval(-0.05))]
+                                  "ageMs": 60_000, "observedAt": iso(bridge.gestureContext!.date.addingTimeInterval(-60))]
         return reply
     }
     _ = startSelection(replyBeforeEnd: true)
@@ -1670,6 +1681,11 @@ func selfTest() throws {
             assert(md.contains("Estimated selection in top-document CSS pixels: x=21.0, y=105.0, width=4.0, height=3.0"), stage)
         }
         assert(bridge.regionContext?.browser?["pointerAnchor"] != nil && md.contains("Observed raw drag extent") && md.contains("source-a"))
+        let savedCalibration = bridge.regionContext!.browser!["pointerAnchor"] as! [String: Any]
+        assert(md.contains(savedCalibration["observedAt"] as! String) && md.contains("- Pointer calibration:") && md.contains("- Page window:") && md.contains("- fullscreen: false"))
+        if !invalidBeforeCapture {
+            assert(md.contains("Retained pointer calibration age at browser observation: 60000.0 ms") && md.contains("Unobserved browser-chrome changes"))
+        }
         let preservedImage = try Data(contentsOf: paths[0]); assert(preservedImage == png)
         bridge.receive(invalidate)
         let repeatedMD = try Data(contentsOf: paths[1])

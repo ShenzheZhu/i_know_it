@@ -107,6 +107,57 @@ struct RegionObservation {
     let displayPixelRect: CGRect
 }
 
+struct RegionShortcut: Equatable {
+    let keycode: Int
+    let flags: CGEventFlags
+    static let standard = RegionShortcut(keycode: 21, flags: [.maskControl, .maskShift, .maskCommand])
+    static let modifierMask: CGEventFlags = [
+        .maskShift, .maskControl, .maskAlternate, .maskCommand,
+        .maskSecondaryFn, .maskNumericPad, .maskHelp
+    ]
+
+    func matches(keycode: Int, flags: CGEventFlags) -> Bool {
+        keycode == self.keycode && flags.intersection(Self.modifierMask) == self.flags
+    }
+
+    static func fromPreferences(_ value: Any?) -> RegionShortcut? {
+        // Entry 31 is macOS's "Copy picture of selected area to the clipboard".
+        // A missing override retains the system default; invalid overrides never do.
+        guard let value else { return .standard }
+        guard let keys = value as? [String: Any] else { return nil }
+        guard let entry = keys["31"] else { return .standard }
+        guard let entry = entry as? [String: Any], let enabled = entry["enabled"] as? NSNumber,
+              enabled.doubleValue == 1 else { return nil }
+        guard let value = entry["value"] else { return .standard }
+        guard let definition = value as? [String: Any], definition["type"] as? String == "standard",
+              let parameters = definition["parameters"] as? [Any], parameters.count == 3 else { return nil }
+        func integer(_ value: Any) -> UInt64? {
+            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue >= 0,
+                  number.doubleValue <= Double(UInt32.max),
+                  number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
+            return number.uint64Value
+        }
+        guard let character = integer(parameters[0]), character <= UInt16.max,
+              let key = integer(parameters[1]), key < UInt16.max,
+              ![54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(key),
+              let modifiers = integer(parameters[2]) else { return nil }
+        let flags = CGEventFlags(rawValue: modifiers)
+        guard flags.subtracting(modifierMask).isEmpty else { return nil }
+        // Plain letters, digits and Shift-typing cannot start background tracking.
+        let functionKeys: Set<UInt64> = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109,
+                                       103, 111, 105, 107, 113, 106, 64, 79, 80, 90]
+        guard !flags.intersection([.maskControl, .maskAlternate, .maskCommand]).isEmpty
+                || functionKeys.contains(key) else { return nil }
+        return RegionShortcut(keycode: Int(key), flags: flags)
+    }
+
+    static func current() -> RegionShortcut? {
+        fromPreferences(CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString,
+                                                 "com.apple.symbolichotkeys" as CFString))
+    }
+}
+
 // Correlates an observed plain selection with a fresh clipboard image. This is
 // not a receipt from macOS and cannot establish the image's source/provenance.
 struct RegionGestureTracker {
@@ -114,27 +165,33 @@ struct RegionGestureTracker {
         let startedAt: TimeInterval
         let clipboardCount: Int
         let displays: [RegionDisplay]
+        let shortcut: RegionShortcut
         var lastAt: TimeInterval
-        var remainingShortcutModifiers: CGEventFlags = [.maskShift, .maskCommand]
+        var remainingShortcutModifiers: CGEventFlags
         var keyReleased = false
         var start: CGPoint?
         var observation: RegionObservation?
     }
     private var selection: Selection?
+    private(set) var shortcut: RegionShortcut?
     private(set) var diagnostic = "No matching screenshot selection was observed."
     var isArmed: Bool { selection != nil }
     var isSelecting: Bool { selection != nil && selection?.observation == nil }
     var startedAt: TimeInterval? { selection?.startedAt }
 
+    init(shortcut: RegionShortcut? = .standard) { self.shortcut = shortcut }
+
+    @discardableResult
+    mutating func setShortcut(_ value: RegionShortcut?) -> Bool {
+        guard value != shortcut else { return false }
+        shortcut = value
+        reset("Screenshot shortcut settings changed; selection tracking was reset.")
+        return true
+    }
+
     mutating func reset(_ reason: String = "Selection tracking was reset.") {
         selection = nil; diagnostic = reason
     }
-
-    private static let modifiers: CGEventFlags = [
-        .maskShift, .maskControl, .maskAlternate, .maskCommand,
-        .maskSecondaryFn, .maskNumericPad, .maskHelp
-    ]
-    private static let shortcut: CGEventFlags = [.maskControl, .maskShift, .maskCommand]
 
     private static func integral(_ value: CGFloat) -> Bool {
         value.isFinite && value.rounded(.towardZero) == value
@@ -164,18 +221,19 @@ struct RegionGestureTracker {
                           keycode: Int = 0, isRepeat: Bool = false,
                           location: CGPoint = .zero, clipboardCount: Int,
                           displays: [RegionDisplay], now: TimeInterval) -> Bool {
-        let modifiers = flags.intersection(Self.modifiers)
+        let modifiers = flags.intersection(RegionShortcut.modifierMask)
         if isArmed && !current(now: now, displays: displays) {
             reset("Selection expired, event time was invalid, or display layout changed.")
         }
         let wasArmed = isArmed
-        if type == .keyDown && keycode == 21 {
+        if type == .keyDown, let shortcut, keycode == shortcut.keycode {
             defer { if wasArmed { reset() } }
-            guard !wasArmed, !isRepeat, modifiers == Self.shortcut,
+            guard !wasArmed, !isRepeat, shortcut.matches(keycode: keycode, flags: flags),
                   now.isFinite, now >= 0, clipboardCount >= 0, clipboardCount < Int.max,
                   Self.valid(displays) else { return false }
             selection = Selection(startedAt: now, clipboardCount: clipboardCount,
-                                  displays: displays.sorted(by: { $0.id < $1.id }), lastAt: now)
+                                  displays: displays.sorted(by: { $0.id < $1.id }), shortcut: shortcut,
+                                  lastAt: now, remainingShortcutModifiers: shortcut.flags.subtracting(.maskControl))
             diagnostic = "Shortcut observed; waiting for mouse-down."
             return true
         }
@@ -197,7 +255,7 @@ struct RegionGestureTracker {
         switch type {
         case .flagsChanged, .mouseMoved:
             break
-        case .keyUp where keycode == 21 && !state.keyReleased:
+        case .keyUp where keycode == state.shortcut.keycode && !state.keyReleased:
             state.keyReleased = true
         case .leftMouseDown:
             guard state.start == nil, other.isEmpty,
@@ -327,6 +385,9 @@ final class Bridge {
         enabledChanged(value)
     }
     func cancelGesture() { gesture.reset(); gestureContext = nil }
+    func setRegionShortcut(_ value: RegionShortcut?) {
+        if gesture.setShortcut(value) { gestureContext = nil }
+    }
     func observeGesture(type: CGEventType, flags: CGEventFlags, keycode: Int64 = 0,
                         isRepeat: Bool = false, location: CGPoint = .zero) {
         guard enabled else { cancelGesture(); return }
@@ -385,7 +446,7 @@ final class Bridge {
         if let region, let context = regionContext {
             func rect(_ r: CGRect) -> String { "x=\(r.minX), y=\(r.minY), width=\(r.width), height=\(r.height)" }
             lines += ["", "## Observed screenshot selection (correlated, not verified)",
-                "- Shortcut: Control + Shift + Command + 4",
+                "- Shortcut: Configured macOS region-to-clipboard shortcut",
                 "- Shortcut observed at: \(iso(context.date))",
                 "- Foreground app at shortcut: \(quoted(context.app ?? "unknown"))",
                 "- Observed raw drag extent in global display points: \(rect(region.globalRect))",
@@ -511,6 +572,7 @@ final class RegionInputMonitor {
     let preflight: () -> Bool
     let requestPermission: () -> Bool
     let statusChanged: (String) -> Void
+    let readShortcut: () -> RegionShortcut?
     var tap: CFMachPort?
     var source: CFRunLoopSource?
     var status = ""
@@ -518,9 +580,12 @@ final class RegionInputMonitor {
 
     init(bridge: Bridge, preflight: @escaping () -> Bool,
          requestPermission: @escaping () -> Bool = { CGRequestListenEventAccess() },
+         readShortcut: @escaping () -> RegionShortcut? = RegionShortcut.current,
          statusChanged: @escaping (String) -> Void = { try? send(["type": "input-status", "status": $0]) }) {
         self.bridge = bridge; self.preflight = preflight
         self.requestPermission = requestPermission; self.statusChanged = statusChanged
+        self.readShortcut = readShortcut
+        bridge.setRegionShortcut(readShortcut())
     }
     func report(_ value: String) {
         guard status != value else { return }
@@ -535,6 +600,7 @@ final class RegionInputMonitor {
     }
     func update() {
         guard bridge.enabled else { stop(); report("off"); return }
+        bridge.setRegionShortcut(readShortcut())
         // Creating an unauthorized tap can itself prompt. Never do so from startup or polling.
         guard preflight() else { stop(); report("permission-required"); return }
         guard tap == nil else { return }
@@ -575,7 +641,10 @@ final class RegionInputMonitor {
         }
         guard bridge.enabled else { return }
         // Ignore ordinary keyboard/pointer activity immediately; never retain its text or history.
-        guard bridge.gesture.isArmed || (type == .keyDown && event.getIntegerValueField(.keyboardEventKeycode) == 21) else { return }
+        guard bridge.gesture.isArmed || (type == .keyDown
+            && event.getIntegerValueField(.keyboardEventAutorepeat) == 0
+            && bridge.gesture.shortcut?.matches(keycode: Int(event.getIntegerValueField(.keyboardEventKeycode)),
+                                                flags: event.flags) == true) else { return }
         bridge.observeGesture(type: type, flags: event.flags,
             keycode: event.getIntegerValueField(.keyboardEventKeycode),
             isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0, location: event.location)
@@ -624,6 +693,65 @@ func regionSelfTest() {
         tracker.consume(width: width, height: height, clipboardCount: count,
                         displays: screens, now: time)
     }
+
+    func preferences(key: Any = 21, flags: Any = UInt64(CGEventFlags.maskControl.rawValue),
+                     character: Any = 52, enabled: Any = true) -> [String: Any] {
+        ["31": ["enabled": enabled, "value": ["type": "standard", "parameters": [character, key, flags]]]]
+    }
+    let control4 = RegionShortcut(keycode: 21, flags: .maskControl)
+    let customKey = RegionShortcut(keycode: 1, flags: [.maskAlternate, .maskCommand])
+    check(RegionShortcut.fromPreferences(nil) == .standard, "absent preferences use default shortcut")
+    check(RegionShortcut.fromPreferences([:]) == .standard, "absent entry uses default shortcut")
+    check(RegionShortcut.fromPreferences(["31": ["enabled": true]]) == .standard, "enabled default without value")
+    check(RegionShortcut.fromPreferences(preferences()) == control4, "live custom Control-4 override")
+    check(RegionShortcut.fromPreferences(preferences(key: 1, flags: customKey.flags.rawValue)) == customKey,
+          "custom physical key and modifier override")
+    check(RegionShortcut.fromPreferences(preferences(key: 122, flags: 0, character: 65535))?.keycode == 122,
+          "unmodified function key is not plain typing")
+    check(RegionShortcut.fromPreferences(preferences(enabled: false)) == nil, "explicitly disabled shortcut")
+    for value: Any in ["invalid", ["31": "invalid"], ["31": [:]], ["31": ["enabled": "true"]],
+                      ["31": ["enabled": true, "value": [:]]],
+                      ["31": ["enabled": true, "value": ["type": "other", "parameters": [52, 21, 262144]]]],
+                      ["31": ["enabled": true, "value": ["type": "standard", "parameters": [21, 262144]]]]] {
+        check(RegionShortcut.fromPreferences(value) == nil, "malformed setting never falls back")
+    }
+    for key: Any in [-1, 65535, 65536, true, "21", 21.5, Double.infinity, Double.nan] {
+        check(RegionShortcut.fromPreferences(preferences(key: key)) == nil, "invalid keycode rejected")
+    }
+    for key in 54...63 {
+        check(RegionShortcut.fromPreferences(preferences(key: key)) == nil, "modifier-only key rejected")
+    }
+    for flags: Any in [-1, true, "262144", 262144.5, UInt64.max, CGEventFlags.maskAlphaShift.rawValue] {
+        check(RegionShortcut.fromPreferences(preferences(flags: flags)) == nil, "invalid modifier mask rejected")
+    }
+    for flags in [CGEventFlags(), .maskShift, .maskSecondaryFn, .maskNumericPad] {
+        check(RegionShortcut.fromPreferences(preferences(flags: flags.rawValue)) == nil, "plain or Shift-typing cannot arm")
+    }
+    check(!customKey.matches(keycode: 21, flags: customKey.flags)
+          && !customKey.matches(keycode: 1, flags: customKey.flags.union(.maskControl)), "exact configured key and modifiers only")
+    check(customKey.matches(keycode: 1, flags: customKey.flags.union(.maskAlphaShift)), "custom chord ignores Caps Lock")
+    for shortcut in [control4, customKey] {
+        var custom = RegionGestureTracker(shortcut: shortcut)
+        check(custom.observe(type: .keyDown, flags: shortcut.flags, keycode: shortcut.keycode,
+                             clipboardCount: 40, displays: displays, now: 100), "custom shortcut arms")
+        event(&custom, .keyUp, flags: shortcut.flags, key: shortcut.keycode)
+        event(&custom, .flagsChanged, flags: shortcut.flags.intersection(.maskCommand), time: 101.1)
+        event(&custom, .flagsChanged, time: 101.2)
+        event(&custom, .leftMouseDown, 100, 200, flags: .maskControl, time: 101.3)
+        event(&custom, .leftMouseDragged, 299.25, 399.5, flags: .maskControl, time: 101.4)
+        event(&custom, .leftMouseUp, 400, 450, flags: .maskControl, time: 101.5)
+        check(consume(&custom) != nil, "custom key release, initial modifiers release, Control-drag retained")
+    }
+    var changedShortcut = armed()
+    check(!changedShortcut.setShortcut(.standard) && changedShortcut.isArmed, "unchanged setting retains pending selection")
+    check(changedShortcut.setShortcut(control4) && !changedShortcut.isArmed, "changed setting cancels pending selection")
+    check(!changedShortcut.observe(type: .keyDown, flags: chord, keycode: 21,
+                                  clipboardCount: 40, displays: displays, now: 101), "old default chord no longer arms")
+    check(changedShortcut.observe(type: .keyDown, flags: .maskControl, keycode: 21,
+                                 clipboardCount: 40, displays: displays, now: 102), "new configured chord arms")
+    check(changedShortcut.setShortcut(nil) && !changedShortcut.isArmed, "disabling shortcut cancels pending selection")
+    check(!changedShortcut.observe(type: .keyDown, flags: .maskControl, keycode: 21,
+                                  clipboardCount: 40, displays: displays, now: 103), "disabled shortcut never arms")
 
     var tracker = completed()
     let retina = consume(&tracker)
@@ -1043,6 +1171,7 @@ func selfTest() throws {
     let selectionMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
     assert(selectionMD.contains("source-a") && selectionMD.contains("correlated, not verified") && selectionMD.contains("x=-80.0"))
     assert(selectionMD.contains("requested at the screenshot shortcut") && !selectionMD.contains("## Browser tab observed after"))
+    assert(selectionMD.contains("Configured macOS region-to-clipboard shortcut") && !selectionMD.contains("Control + Shift + Command + 4"))
     assert(selectionMD.contains("raw drag extent") && selectionMD.contains("at most 2.0 pixels") && !selectionMD.contains("identical image dimensions"))
     assert(!selectionMD.contains("- Last selection tracking status"))
     let regionPNG = try Data(contentsOf: bridge.files![0]); assert(regionPNG == png)
@@ -1091,7 +1220,8 @@ func selfTest() throws {
 
     var permissionRequests = 0, inputStates: [String] = []
     let monitor = RegionInputMonitor(bridge: bridge, preflight: { false },
-        requestPermission: { permissionRequests += 1; return false }, statusChanged: { inputStates.append($0) })
+        requestPermission: { permissionRequests += 1; return false }, readShortcut: { .standard },
+        statusChanged: { inputStates.append($0) })
     monitor.update(); monitor.requestAccess()
     assert(permissionRequests == 0 && monitor.status == "off")
     bridge.setEnabled(true); monitor.update(); monitor.poll()
@@ -1100,6 +1230,42 @@ func selfTest() throws {
     assert(permissionRequests == 1 && monitor.tap == nil)
     bridge.setEnabled(false); monitor.update()
     assert(inputStates == ["off", "permission-required", "off"])
+    var configuredShortcut: RegionShortcut? = RegionShortcut(keycode: 21, flags: .maskControl)
+    let configuredMonitor = RegionInputMonitor(bridge: bridge, preflight: { false },
+        readShortcut: { configuredShortcut }, statusChanged: { _ in })
+    assert(bridge.gesture.shortcut == configuredShortcut, "Initial configuration must load before enabling")
+    var geometryReads = 0
+    let savedDisplays = bridge.displays
+    bridge.displays = { geometryReads += 1; return savedDisplays() }
+    bridge.setEnabled(true); app = "com.google.Chrome"
+    // Construct local events for the callback only; never post input or open a tap.
+    let keyEvent = CGEvent(keyboardEventSource: nil, virtualKey: 21, keyDown: true)!
+    keyEvent.flags = [.maskControl, .maskShift, .maskCommand]
+    configuredMonitor.handle(.keyDown, keyEvent)
+    assert(geometryReads == 0 && !bridge.gesture.isArmed, "Old chord must be filtered before geometry/context reads")
+    keyEvent.flags = .maskControl
+    configuredMonitor.handle(.keyDown, keyEvent)
+    assert(geometryReads == 1 && bridge.gesture.isArmed && bridge.gestureContext != nil)
+    let previousContext = bridge.gestureContext!.id
+    bridge.setRegionShortcut(configuredShortcut)
+    assert(bridge.gestureContext?.id == previousContext, "Unchanged preference must retain context")
+    configuredShortcut = RegionShortcut(keycode: 1, flags: [.maskAlternate, .maskCommand])
+    bridge.setRegionShortcut(configuredShortcut)
+    assert(!bridge.gesture.isArmed && bridge.gestureContext == nil, "A changed shortcut must drop its pending context")
+    bridge.receive(selectionReply(previousContext))
+    assert(bridge.browser == nil, "An old shortcut reply must not become browser context")
+    keyEvent.setIntegerValueField(.keyboardEventKeycode, value: 1)
+    keyEvent.flags = [.maskAlternate, .maskCommand]
+    configuredMonitor.handle(.keyDown, keyEvent)
+    assert(bridge.gesture.isArmed && bridge.gestureContext?.id != previousContext, "Custom key passes the shared monitor filter")
+    configuredShortcut = nil
+    configuredMonitor.poll()
+    assert(bridge.gesture.shortcut == nil && !bridge.gesture.isArmed && bridge.gestureContext == nil,
+           "Preference refresh must drop disabled selection/context without a callback read")
+    let readsBeforeDisabledKey = geometryReads
+    configuredMonitor.handle(.keyDown, keyEvent)
+    assert(geometryReads == readsBeforeDisabledKey, "Disabled shortcut cannot retain keyboard context")
+    bridge.setEnabled(false); configuredMonitor.update(); bridge.displays = savedDisplays
     print("PASS: shortcut-time context, delayed clipboard fill, coordinate attachment, late/stale replies, OFF, and explicit-only permission requests.")
 
     bitmap.setColor(NSColor(deviceRed: 1, green: 0, blue: 0, alpha: 1), atX: 0, y: 0)

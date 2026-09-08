@@ -32,12 +32,13 @@ import Foundation
 let board = NSPasteboard(name: NSPasteboard.Name(CommandLine.arguments[1]))
 let operation = CommandLine.arguments[2]
 if operation == "release" { board.releaseGlobally(); exit(0) }
-if operation == "image" {
+if ["image", "declared-image"].contains(operation) {
  let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 6, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
  bitmap.bitmapData!.initialize(repeating: 127, count: bitmap.bytesPerRow * bitmap.pixelsHigh)
  let png = bitmap.representation(using: .png, properties: [:])!
- board.clearContents()
- // Deterministically expose a polling tick between clearing and supplying the image.
+ if operation == "declared-image" { board.declareTypes([.png], owner: nil) }
+ else { board.clearContents() }
+ // Both empty and advertised-but-unavailable images may fill without a new generation.
  Thread.sleep(forTimeInterval: 0.20)
  board.setData(png, forType: .png)
 }
@@ -64,7 +65,7 @@ function frame(value) {
 }
 const results = [];
 (async () => {
-  for (const mode of ['EOF', 'SIGTERM', 'SIGINT', 'malformed-frame', 'OFF', 'newer-copy', 'broken-pipe', 'second-owner', 'browser-internal-page']) {
+  for (const mode of ['EOF', 'SIGTERM', 'SIGINT', 'malformed-frame', 'OFF', 'newer-copy', 'broken-pipe', 'second-owner', 'browser-internal-page', 'declared-image']) {
     const name = `com.iknowit.process-test.${crypto.randomUUID()}`;
     const folder = path.join(output, mode); fs.mkdirSync(folder, { recursive: true });
     const app = path.join(folder, 'app'); fs.writeFileSync(app, 'com.google.Chrome');
@@ -90,7 +91,7 @@ const results = [];
       const enabled = frame({ type: 'enabled', enabled: true });
       for (const bytes of [enabled.subarray(0, 1), enabled.subarray(1, 3), enabled.subarray(3, 7), enabled.subarray(7)]) { child.stdin.write(bytes); await delay(10); }
       await until(() => messages.some(m => m.type === 'test-enabled' && m.enabled), `${mode}: enabled`);
-      const originalPNG = state('image').png;
+      const originalPNG = state(mode === 'declared-image' ? 'declared-image' : 'image').png;
       assert(originalPNG);
       await until(() => messages.some(m => m.type === 'request-context'), `${mode}: browser request`);
       const requestId = messages.find(m => m.type === 'request-context').requestId;
@@ -128,7 +129,7 @@ const results = [];
           await until(() => messages.some(m => m.type === 'test-enabled' && !m.enabled), 'disabled acknowledgement');
           assert.equal(state().png, originalPNG); child.stdin.end();
         } else if (mode === 'newer-copy') { state('text'); child.kill('SIGTERM'); }
-        else if (mode === 'EOF' || internal) child.stdin.end();
+        else if (mode === 'EOF' || internal || mode === 'declared-image') child.stdin.end();
         else if (mode === 'malformed-frame') child.stdin.write(Buffer.from([0, 0, 0, 0]));
         else child.kill(mode);
         await until(() => ended, `${mode}: process exits`);

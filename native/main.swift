@@ -424,13 +424,92 @@ func estimatePageRegion(_ region: RegionObservation, context: GestureContext) ->
     return PageRegionEstimate(origin: origin, viewportRect: viewportRect, documentRect: documentRect, anchorAgeMs: age)
 }
 
+struct PasteboardEpoch: Equatable {
+    let pid: pid_t
+    let seconds: UInt64
+    let microseconds: UInt64
+}
+
+func currentPasteboardEpoch() -> PasteboardEpoch? {
+    let bytes = proc_listpids(UInt32(PROC_UID_ONLY), getuid(), nil, 0)
+    guard bytes > 0, bytes < 800_000 else { return nil }
+    var pids = [pid_t](repeating: 0, count: Int(bytes) / MemoryLayout<pid_t>.stride + 64)
+    let capacity = pids.count * MemoryLayout<pid_t>.stride
+    let actual = proc_listpids(UInt32(PROC_UID_ONLY), getuid(), &pids, Int32(capacity))
+    guard actual > 0, actual < capacity, Int(actual) % MemoryLayout<pid_t>.stride == 0 else { return nil }
+    var epochs: [PasteboardEpoch] = []
+    for pid in pids.prefix(Int(actual) / MemoryLayout<pid_t>.stride) where pid > 0 {
+        var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        if proc_pidpath(pid, &path, UInt32(path.count)) <= 0 {
+            if errno == ESRCH { continue } // The process exited after the UID-scoped inventory.
+            return nil
+        }
+        guard String(cString: path) == "/usr/libexec/pboard" else { continue }
+        var info = proc_bsdinfo()
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.stride)) == MemoryLayout<proc_bsdinfo>.stride,
+              info.pbi_uid == getuid(), info.pbi_start_tvsec > 0 else { return nil }
+        epochs.append(PasteboardEpoch(pid: pid, seconds: info.pbi_start_tvsec, microseconds: info.pbi_start_tvusec))
+    }
+    return epochs.count == 1 ? epochs[0] : nil
+}
+
+// Unlike an image decode, recovery requires every advertised representation.
+func completePasteboardItems(_ board: NSPasteboard, expected: [[NSPasteboard.PasteboardType: Data]]? = nil, onMissingData: (() -> Void)? = nil) -> [[NSPasteboard.PasteboardType: Data]]? {
+    guard let entries = board.pasteboardItems, !entries.isEmpty, entries.count <= 2 else { return nil }
+    guard !entries.contains(where: { entry in entry.types.contains(where: {
+        $0.rawValue == "org.nspasteboard.ConcealedType" || $0.rawValue == "org.nspasteboard.TransientType"
+    }) }) else { return nil }
+    if let expected {
+        guard expected.count == entries.count, zip(entries, expected).allSatisfy({ Set($0.0.types) == Set($0.1.keys) }) else { return nil }
+    }
+    var total = 0, result: [[NSPasteboard.PasteboardType: Data]] = []
+    for (index, entry) in entries.enumerated() {
+        var values: [NSPasteboard.PasteboardType: Data] = [:]
+        let types = expected.map { expected in entry.types.sorted { expected[index][$0]!.count < expected[index][$1]!.count } } ?? entry.types
+        for type in types {
+            guard let data = entry.data(forType: type) else { onMissingData?(); return nil }
+            total += data.count
+            guard total <= 200_000_000 else { return nil }
+            values[type] = data
+        }
+        guard !values.isEmpty else { return nil }
+        result.append(values)
+    }
+    return result
+}
+
+struct SuspendedCapture {
+    let generation: Int
+    let items: [[NSPasteboard.PasteboardType: Data]]
+    let epoch: PasteboardEpoch
+    let suspendedAt: TimeInterval
+    let image: ClipboardImage
+    let region: RegionObservation
+    var context: GestureContext
+    let observedAt: Date
+    let observedApp: String?
+    let browser: [String: Any]?
+    let files: [URL]?
+    let owned: Int?
+    let ownershipToken: String?
+    var metadataNeedsRewrite = false
+}
+
 final class Bridge {
     let board: NSPasteboard
     let directory: URL
     let currentApp: () -> String?
     let request: (String) -> Void
+    var clipboardCount: () -> Int
+    var pasteboardEpoch: () -> PasteboardEpoch? = currentPasteboardEpoch
+    var captureEpoch: PasteboardEpoch?
+    var captureItems: [[NSPasteboard.PasteboardType: Data]]?
+    var suspended: SuspendedCapture?
+    var deferredImage: (generation: Int, deadline: TimeInterval)?
+    var recoveryPending = false
     var enabled = false
     var seen: Int
+    var observedGeneration: Int
     var owned: Int?
     var ownershipToken: String?
     var original: ClipboardImage?
@@ -450,7 +529,8 @@ final class Bridge {
 
     init(board: NSPasteboard, directory: URL, currentApp: @escaping () -> String?, request: @escaping (String) -> Void) {
         self.board = board; self.directory = directory; self.currentApp = currentApp; self.request = request
-        seen = board.changeCount
+        clipboardCount = { board.changeCount }
+        seen = board.changeCount; observedGeneration = seen
     }
     func setEnabled(_ value: Bool) {
         guard value != enabled else { return }
@@ -458,8 +538,9 @@ final class Bridge {
         if !value {
             restore(); original = nil; files = nil; browser = nil; requestID = nil
             cancelGesture(); region = nil; regionContext = nil; regionDiagnostic = nil
+            suspended = nil; captureEpoch = nil; captureItems = nil; deferredImage = nil; recoveryPending = false
         }
-        seen = board.changeCount
+        seen = clipboardCount(); observedGeneration = seen
         enabledChanged(value)
     }
     func cancelGesture() { gesture.reset(); gestureContext = nil }
@@ -471,7 +552,7 @@ final class Bridge {
         guard enabled else { cancelGesture(); return }
         let now = clock()
         if gesture.observe(type: type, flags: flags, keycode: Int(keycode), isRepeat: isRepeat,
-                           location: location, clipboardCount: board.changeCount, displays: displays(), now: now) {
+                           location: location, clipboardCount: clipboardCount(), displays: displays(), now: now) {
             let context = GestureContext(id: UUID().uuidString, app: currentApp(), date: Date(), time: now)
             gestureContext = context
             if browserApps.contains(context.app ?? "") { request(context.id) }
@@ -481,20 +562,66 @@ final class Bridge {
         if ownsClipboard(), let original { original.restore(board) }
         else {
             // Ownership loss also cancels pending work; never reapply an old image over a newer copy.
-            original = nil; files = nil; browser = nil; requestID = nil
+            original = nil; files = nil; browser = nil; requestID = nil; captureItems = nil; captureEpoch = nil
         }
-        owned = nil; ownershipToken = nil; seen = board.changeCount
+        owned = nil; ownershipToken = nil; seen = clipboardCount(); observedGeneration = seen
+        rememberRepresentations()
+    }
+    func rememberRepresentations() {
+        guard original != nil, region != nil, captureEpoch != nil else { captureItems = nil; return }
+        let items = completePasteboardItems(board)
+        captureItems = clipboardCount() == seen ? items : nil
+    }
+    func suspendCapture() {
+        guard let image = original, !image.items.contains(where: { $0[.fileURL] != nil }),
+              let region, let context = regionContext, let epoch = captureEpoch, let items = captureItems else { return }
+        suspended = SuspendedCapture(generation: seen, items: items, epoch: epoch, suspendedAt: clock(),
+            image: image, region: region, context: context, observedAt: observedAt, observedApp: observedApp,
+            browser: browser, files: files, owned: owned, ownershipToken: ownershipToken)
+    }
+    func recoverSuspended(_ generation: Int) -> Bool {
+        guard let saved = suspended, generation == saved.generation else { return false }
+        guard pasteboardEpoch() == saved.epoch else { suspended = nil; recoveryPending = false; return false }
+        var missing = false
+        let items = completePasteboardItems(board, expected: saved.items, onMissingData: { missing = true })
+        guard clipboardCount() == generation, pasteboardEpoch() == saved.epoch, clipboardCount() == generation else {
+            suspended = nil; recoveryPending = false; return false
+        }
+        if missing {
+            if !recoveryPending { deferredImage = (generation, clock() + 2) }
+            recoveryPending = true
+            if clock() < deferredImage!.deadline { return false }
+            suspended = nil; recoveryPending = false; deferredImage = nil; seen = generation
+            cancelGesture(); return false
+        }
+        guard items == saved.items else { suspended = nil; recoveryPending = false; return false }
+        suspended = nil; cancelGesture(); requestID = nil; deferredImage = nil; recoveryPending = false
+        original = saved.image; region = saved.region; regionContext = saved.context; regionDiagnostic = nil
+        observedAt = saved.observedAt; observedApp = saved.observedApp; browser = saved.browser; files = saved.files
+        seen = generation; owned = saved.owned; ownershipToken = saved.ownershipToken
+        captureEpoch = saved.epoch; captureItems = saved.items
+        // Correct a resurfacing pair before accepting ownership; failed writes withdraw it.
+        if saved.metadataNeedsRewrite { updatePreparedMarkdown() }
+        return true
     }
     func ownsClipboard() -> Bool {
-        guard let count = owned, let token = ownershipToken, board.changeCount == count,
+        guard let count = owned, let token = ownershipToken, clipboardCount() == count,
               let entries = board.pasteboardItems, entries.count == 2,
               entries.allSatisfy({ $0.string(forType: marker) == token }) else { return false }
-        return board.changeCount == count
+        return clipboardCount() == count
     }
     func receive(_ message: [String: Any]) {
         if message["type"] as? String == "enabled", let value = message["enabled"] as? Bool { setEnabled(value); return }
         if enabled, message["type"] as? String == "browser-geometry-invalidated" {
             gestureContext?.geometryInvalidated = true
+            if var saved = suspended, !saved.context.geometryInvalidated {
+                saved.context.geometryInvalidated = true
+                if let md = saved.files?.last {
+                    do { try writeMarkdown(saved.image, to: md, snapshot: saved) }
+                    catch { saved.metadataNeedsRewrite = true }
+                }
+                suspended = saved
+            }
             let changed = regionContext?.geometryInvalidated == false
             regionContext?.geometryInvalidated = true
             if changed { updatePreparedMarkdown() }
@@ -510,7 +637,7 @@ final class Bridge {
             return
         }
         guard id == requestID else { return }
-        guard board.changeCount == seen else { tick(); return }
+        guard clipboardCount() == seen else { tick(); return }
         if let context = browserObservation(message, app: observedApp) {
             browser = context
             // Do not delay paste for the browser; update a prepared context file when its reply arrives.
@@ -519,7 +646,13 @@ final class Bridge {
         requestID = nil
         tick()
     }
-    func markdown(_ image: ClipboardImage) -> String {
+    func markdown(_ image: ClipboardImage, snapshot: SuspendedCapture? = nil) -> String {
+        let observedAt = snapshot?.observedAt ?? self.observedAt
+        let observedApp = snapshot == nil ? self.observedApp : snapshot!.observedApp
+        let browser = snapshot == nil ? self.browser : snapshot!.browser
+        let region = snapshot?.region ?? self.region
+        let regionContext = snapshot?.context ?? self.regionContext
+        let regionDiagnostic = snapshot == nil ? self.regionDiagnostic : nil
         var lines = [
             "# Screenshot context", "",
             "- Image: screenshot.png (original image; no crop, scaling, or annotation).",
@@ -582,8 +715,8 @@ final class Bridge {
         } else { lines.append("- Browser context: unavailable; no page attribution is inferred.") }
         return lines.joined(separator: "\n") + "\n"
     }
-    func writeMarkdown(_ image: ClipboardImage, to url: URL) throws {
-        try Data(markdown(image).utf8).write(to: url, options: .atomic)
+    func writeMarkdown(_ image: ClipboardImage, to url: URL, snapshot: SuspendedCapture? = nil) throws {
+        try Data(markdown(image, snapshot: snapshot).utf8).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
     func updatePreparedMarkdown() {
@@ -597,19 +730,42 @@ final class Bridge {
     }
     func tick() {
         guard enabled else { return }
-        let count = board.changeCount
-        if count != seen {
+        let count = clipboardCount()
+        // ponytail: keep one displaced correlated capture for ten minutes, never an image history.
+        if let saved = suspended, !(0...600).contains(clock() - saved.suspendedAt) {
+            suspended = nil; recoveryPending = false; deferredImage = nil
+        }
+        let rolledBack = count < observedGeneration
+        observedGeneration = count
+        if recoveryPending && deferredImage?.generation != count { recoveryPending = false; deferredImage = nil }
+        let recovered = (rolledBack || recoveryPending) && recoverSuspended(count)
+        if recoveryPending { return }
+        if count != seen && !recovered {
+            suspendCapture()
+            if deferredImage?.generation != count { deferredImage = nil }
             // An external copy always replaces our pending work; never restore over a newer copy.
             owned = nil; ownershipToken = nil; original = nil; files = nil; browser = nil; requestID = nil
-            region = nil; regionContext = nil; regionDiagnostic = nil
+            region = nil; regionContext = nil; regionDiagnostic = nil; captureEpoch = nil; captureItems = nil
             // Clearing and filling a pasteboard can share one change count. Wait for its contents.
             guard let entries = board.pasteboardItems, !entries.isEmpty else { return }
-            seen = count
-            guard let image = ClipboardImage(board), board.changeCount == count else { cancelGesture(); return }
+            // A system writer can advertise PNG/TIFF before supplying its bytes at the same generation.
+            // Retry only missing declared image bytes, for at most two seconds, before any decode.
+            if entries.count == 1, !entries[0].types.contains(.fileURL), !entries[0].types.contains(marker),
+               !entries[0].types.contains(where: { $0.rawValue == "org.nspasteboard.ConcealedType" || $0.rawValue == "org.nspasteboard.TransientType" }),
+               entries[0].types.contains(.png) || entries[0].types.contains(.tiff),
+               entries[0].data(forType: .png) == nil, entries[0].data(forType: .tiff) == nil {
+                if deferredImage?.generation != count { deferredImage = (count, clock() + 2) }
+                if clock() < deferredImage!.deadline { return }
+            }
+            deferredImage = nil; seen = count
+            guard let image = ClipboardImage(board), clipboardCount() == count else { cancelGesture(); return }
             original = image; observedAt = Date(); observedApp = currentApp()
             region = gesture.consume(width: image.width, height: image.height, clipboardCount: count, displays: displays(), now: clock())
             if region == nil { regionDiagnostic = gesture.diagnostic }
-            if region != nil { regionContext = gestureContext; browser = gestureContext?.browser }
+            if region != nil {
+                suspended = nil; regionContext = gestureContext; browser = gestureContext?.browser
+                captureEpoch = pasteboardEpoch(); rememberRepresentations()
+            }
             cancelGesture()
             if region == nil && browserApps.contains(observedApp ?? "") {
                 let id = UUID().uuidString; requestID = id; request(id)
@@ -617,7 +773,7 @@ final class Bridge {
         }
         guard let image = original else { return }
         if !targetApps.contains(currentApp() ?? "") { if owned != nil { restore() }; return }
-        guard owned == nil, board.changeCount == seen else { return }
+        guard owned == nil, clipboardCount() == seen else { return }
         do {
             if files == nil {
                 let folder = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -628,7 +784,7 @@ final class Bridge {
                 try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: png.path)
                 files = [png, md]
             }
-            guard board.changeCount == seen, enabled, targetApps.contains(currentApp() ?? ""), let files else { return }
+            guard clipboardCount() == seen, enabled, targetApps.contains(currentApp() ?? ""), let files else { return }
             let token = UUID().uuidString
             let entries = files.map { url -> NSPasteboardItem in
                 let item = NSPasteboardItem()
@@ -638,11 +794,11 @@ final class Bridge {
             }
             let cleared = board.clearContents()
             if board.writeObjects(entries) {
-                owned = board.changeCount; ownershipToken = token
-                if ownsClipboard() { seen = owned! }
+                owned = clipboardCount(); ownershipToken = token
+                if ownsClipboard() { seen = owned!; observedGeneration = seen; rememberRepresentations() }
                 else { owned = nil; ownershipToken = nil }
             }
-            else if board.changeCount == cleared { image.restore(board); seen = board.changeCount }
+            else if clipboardCount() == cleared { image.restore(board); seen = clipboardCount() }
         } catch {
             // Fail silently and preserve the original clipboard; no retry loop for disk failures.
             original = nil; files = nil; requestID = nil
@@ -1588,6 +1744,163 @@ func selfTest() throws {
     bridge.setEnabled(false)
     print("PASS: page CSS estimates, reply/invalidation races, failed-rewrite withdrawal, raw observation preservation, and OFF/new-gesture isolation.")
 
+    // Public pasteboard generations can temporarily advance for a remote overlay, then return.
+    // Real private boards hold the representations; only their otherwise non-rewindable counter is injected.
+    var displayedCount: Int?
+    let stableEpoch = PasteboardEpoch(pid: 42, seconds: 100, microseconds: 1)
+    var epoch: PasteboardEpoch? = stableEpoch
+    bridge.clipboardCount = { displayedCount ?? board.changeCount }
+    bridge.pasteboardEpoch = { epoch }
+    func replaceItems(_ values: [[NSPasteboard.PasteboardType: Data]]) {
+        board.clearContents()
+        let entries = values.map { data -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, value) in data { item.setData(value, forType: type) }
+            return item
+        }
+        assert(board.writeObjects(entries))
+    }
+    let rollbackCases = ["raw", "owned", "owned-away", "empty-overlay", "deferred-overlay", "newer-equal",
+        "changed-bytes", "changed-types", "epoch", "epoch-race", "count-race", "epoch-unavailable", "off", "expired",
+        "invalidate", "invalidate-owned", "invalidate-failure", "mutable-file", "returned-delayed", "returned-delayed-empty", "returned-delayed-timeout"]
+    for test in rollbackCases {
+        displayedCount = nil; epoch = stableEpoch; bridge.pasteboardEpoch = { epoch }
+        _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) })
+        if test == "mutable-file" {
+            let imageFile = directory.appendingPathComponent("mutable-source.png")
+            try png.write(to: imageFile)
+            let item = NSPasteboardItem(); item.setString(imageFile.absoluteString, forType: .fileURL)
+            board.clearContents(); assert(board.writeObjects([item]))
+        } else { putImage() }
+        bridge.tick(); app = "com.openai.codex"; bridge.tick()
+        assert(bridge.region != nil && bridge.captureItems != nil)
+        let originalFiles = bridge.files!, originalDate = bridge.observedAt, captureID = bridge.regionContext!.id
+        let keepOwned = ["owned", "owned-away", "invalidate-owned", "invalidate-failure"].contains(test)
+        if !keepOwned { app = "com.google.Chrome"; bridge.tick() }
+        let generation = bridge.seen, oldItems = completePasteboardItems(board)!
+        if test == "empty-overlay" || test == "returned-delayed-empty" { board.clearContents() }
+        else if test == "deferred-overlay" { board.declareTypes([.png], owner: nil) }
+        else { board.clearContents(); board.setString("remote overlay", forType: .string) }
+        bridge.tick()
+        if test == "mutable-file" { assert(bridge.suspended == nil); continue }
+        assert(bridge.suspended?.generation == generation && bridge.original == nil, test)
+        if test.hasPrefix("invalidate") {
+            if test == "invalidate-failure" {
+                try FileManager.default.moveItem(at: originalFiles[1], to: originalFiles[1].appendingPathExtension("saved"))
+                try FileManager.default.createDirectory(at: originalFiles[1], withIntermediateDirectories: false)
+            }
+            bridge.receive(invalidate)
+            assert(bridge.suspended?.context.geometryInvalidated == true)
+            if test == "invalidate-failure" { assert(bridge.suspended?.metadataNeedsRewrite == true) }
+        }
+        if test == "off" { bridge.setEnabled(false); assert(bridge.suspended == nil) }
+        if test == "expired" { now += 601 }
+        if test == "epoch" { epoch = PasteboardEpoch(pid: 42, seconds: 101, microseconds: 1) }
+        if test == "epoch-unavailable" { epoch = nil }
+        var returned = oldItems
+        if test == "changed-bytes" { returned[0][.png] = Data("different image data".utf8) }
+        if test == "changed-types" { returned[0][.string] = Data("additional user data".utf8) }
+        if test.hasPrefix("returned-delayed") {
+            board.declareTypes([.png], owner: nil); displayedCount = generation
+            bridge.tick()
+            assert(bridge.recoveryPending && bridge.suspended?.context.id == captureID)
+            now += test == "returned-delayed-timeout" ? 2.1 : 0.2
+            if test != "returned-delayed-timeout" { assert(board.setData(png, forType: .png)) }
+        } else { replaceItems(returned) }
+        displayedCount = test == "newer-equal" ? bridge.observedGeneration + 1 : generation
+        var epochReads = 0
+        if test == "epoch-race" || test == "count-race" {
+            bridge.pasteboardEpoch = {
+                epochReads += 1
+                if epochReads == 2 {
+                    if test == "count-race" { displayedCount = generation + 1 }
+                    else { return PasteboardEpoch(pid: 43, seconds: 100, microseconds: 1) }
+                }
+                return stableEpoch
+            }
+        }
+        app = test == "owned-away" ? "com.google.Chrome" : "com.openai.codex"
+        bridge.tick()
+        let rejected = ["newer-equal", "changed-bytes", "changed-types", "epoch", "epoch-race", "count-race", "epoch-unavailable", "off", "expired", "returned-delayed-timeout"].contains(test)
+        if rejected { assert(bridge.region == nil && bridge.regionContext == nil, test) }
+        else {
+            assert(bridge.regionContext?.id == captureID && bridge.observedAt == originalDate, test)
+            assert(bridge.region?.globalRect == CGRect(x: -80, y: -20, width: 4, height: 3), test)
+            let recoveredMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
+            if test.hasPrefix("invalidate") { assert(!recoveredMD.contains("Estimated selection") && recoveredMD.contains("browser geometry changed"), test) }
+            else { assert(recoveredMD.contains("Estimated selection in viewport CSS pixels"), test) }
+            if test == "invalidate-failure" { assert(bridge.files != originalFiles && bridge.ownsClipboard()) }
+            else { assert(bridge.files == originalFiles, test) }
+            if test == "owned-away" { assert(bridge.owned == nil && board.data(forType: .png) == png) }
+        }
+    }
+    displayedCount = nil; bridge.clipboardCount = { board.changeCount }; bridge.pasteboardEpoch = { stableEpoch }
+    _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) })
+    putImage(); app = "com.openai.codex"; bridge.tick()
+    board.clearContents(); board.setString("new confidential owner", forType: .string)
+    bridge.restore()
+    assert(bridge.captureItems == nil && bridge.captureEpoch == nil && board.string(forType: .string) == "new confidential owner")
+
+    for correlated in [false, true] {
+        if correlated { _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) }) }
+        else { bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true) }
+        board.declareTypes([.png], owner: nil)
+        let emptyCount = board.changeCount
+        bridge.tick()
+        assert(bridge.seen != emptyCount && bridge.original == nil && bridge.deferredImage != nil)
+        now += 0.2
+        assert(board.setData(png, forType: .png) && board.changeCount == emptyCount)
+        bridge.tick()
+        assert(bridge.original?.png == png && (bridge.region != nil) == correlated)
+    }
+    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
+    board.declareTypes([.png], owner: nil); bridge.tick(); let pendingCount = board.changeCount
+    now += 2.1; bridge.tick()
+    assert(bridge.seen == pendingCount && bridge.deferredImage == nil && bridge.original == nil)
+    board.setData(png, forType: .png); bridge.tick()
+    assert(bridge.original == nil, "Expired missing-data retries must not poll forever")
+    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
+    board.declareTypes([.png], owner: nil); bridge.tick()
+    let deniedDeadline = bridge.deferredImage!.deadline, deniedCount = board.changeCount
+    let deniedMonitor = RegionInputMonitor(bridge: bridge, preflight: { false }, readShortcut: { .standard }, statusChanged: { _ in })
+    now += 1; deniedMonitor.update(); bridge.tick()
+    assert(bridge.deferredImage?.deadline == deniedDeadline, "Permission polling must not renew a missing-image deadline")
+    now += 1.1; deniedMonitor.update(); bridge.tick()
+    assert(bridge.seen == deniedCount && bridge.deferredImage == nil && bridge.original == nil)
+    bridge.setEnabled(false)
+    final class UnreadImageProvider: NSObject, NSPasteboardItemDataProvider {
+        var reads = 0
+        func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+            reads += 1
+        }
+    }
+    for type in [marker, NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"), NSPasteboard.PasteboardType("org.nspasteboard.TransientType")] {
+        app = "com.google.Chrome"; bridge.setEnabled(true)
+        let provider = UnreadImageProvider(), item = NSPasteboardItem()
+        item.setDataProvider(provider, forTypes: [.png]); item.setString("private", forType: type)
+        board.clearContents(); assert(board.writeObjects([item])); bridge.tick()
+        assert(provider.reads == 0 && bridge.deferredImage == nil)
+        assert(completePasteboardItems(board, expected: [[.png: png]]) == nil && provider.reads == 0)
+        if type != marker { assert(completePasteboardItems(board) == nil && provider.reads == 0) }
+        bridge.setEnabled(false)
+    }
+    _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) })
+    putImage(); bridge.tick(); let earlierCaptureID = bridge.regionContext!.id
+    board.clearContents(); board.setString("remote overlay", forType: .string); bridge.tick()
+    assert(bridge.suspended != nil)
+    now += 10
+    bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
+    bridge.receive(pageReply(requested))
+    bridge.observeGesture(type: .flagsChanged, flags: [])
+    bridge.observeGesture(type: .leftMouseDown, flags: [], location: CGPoint(x: -80, y: -20))
+    now += 0.2
+    bridge.observeGesture(type: .leftMouseUp, flags: [], location: CGPoint(x: -76, y: -17))
+    putImage(); bridge.tick()
+    assert(bridge.suspended == nil && bridge.regionContext?.id != earlierCaptureID && bridge.region != nil)
+    bridge.setEnabled(false)
+    bridge.pasteboardEpoch = currentPasteboardEpoch
+    print("PASS: 21 private-board rollback cases, exact generation/representations/epoch, cached invalidation, ownership, and bounded deferred image data.")
+
     var permissionRequests = 0, inputStates: [String] = []
     let monitor = RegionInputMonitor(bridge: bridge, preflight: { false },
         requestPermission: { permissionRequests += 1; return false }, readShortcut: { .standard },
@@ -1714,7 +2027,7 @@ let bridge = Bridge(board: .general, directory: support.appendingPathComponent("
 })
 let inputMonitor = RegionInputMonitor(bridge: bridge, preflight: { CGPreflightListenEventAccess() })
 bridge.enabledChanged = { _ in inputMonitor.update() }
-func shutdown() { inputMonitor.stop(); bridge.restore(); exit(0) }
+func shutdown() { inputMonitor.stop(); bridge.suspended = nil; bridge.restore(); exit(0) }
 // ponytail: restore on normal shutdown; SIGKILL and crashes cannot run cleanup without a persistent recovery journal.
 let signalSources = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
     signal(number, SIG_IGN)

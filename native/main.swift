@@ -25,7 +25,7 @@ func browserObservation(_ message: [String: Any], app: String?) -> [String: Any]
         result["pageUnavailableReason"] = "browser-internal-page"
     }
     if result["pageAvailable"] as? Bool == false {
-        for key in ["viewport", "scroll", "visualViewport", "devicePixelRatio"] { result[key] = nil }
+        for key in ["viewport", "scroll", "visualViewport", "devicePixelRatio", "pointerAnchor", "pageWindow", "fullscreen"] { result[key] = nil }
     }
     return result
 }
@@ -344,6 +344,80 @@ struct GestureContext {
     let date: Date
     let time: TimeInterval
     var browser: [String: Any]?
+    var geometryInvalidated = false
+}
+
+struct PageRegionEstimate {
+    let origin: CGPoint
+    let viewportRect: CGRect
+    let documentRect: CGRect
+    let anchorAgeMs: CGFloat
+}
+
+func estimatePageRegion(_ region: RegionObservation, context: GestureContext) -> PageRegionEstimate? {
+    func number(_ values: [String: Any], _ key: String) -> CGFloat? {
+        guard let value = values[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+              value.doubleValue.isFinite else { return nil }
+        return CGFloat(value.doubleValue)
+    }
+    func boolean(_ value: Any?, equals expected: Bool) -> Bool {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return false }
+        return number.boolValue == expected
+    }
+    func valid(_ rect: CGRect) -> Bool {
+        rect.width > 0 && rect.height > 0 &&
+            [rect.minX, rect.minY, rect.maxX, rect.maxY, rect.width, rect.height].allSatisfy(\.isFinite)
+    }
+    guard !context.geometryInvalidated, browserApps.contains(context.app ?? ""),
+          let browser = context.browser,
+          boolean(browser["available"], equals: true), boolean(browser["pageAvailable"], equals: true),
+          boolean(browser["fullscreen"], equals: false),
+          let url = browser["url"] as? String, let parsed = URL(string: url),
+          ["https", "http"].contains(parsed.scheme ?? ""), parsed.host?.isEmpty == false,
+          let anchor = browser["pointerAnchor"] as? [String: Any],
+          let screen = anchor["screen"] as? [String: Any], let client = anchor["client"] as? [String: Any],
+          let screenX = number(screen, "x"), let screenY = number(screen, "y"),
+          let clientX = number(client, "x"), let clientY = number(client, "y"),
+          let age = number(anchor, "ageMs"), (0...1000).contains(age),
+          let stamp = anchor["observedAt"] as? String, stamp.count <= 64,
+          let viewport = browser["viewport"] as? [String: Any],
+          let width = number(viewport, "width"), let height = number(viewport, "height"), width > 0, height > 0,
+          (0...width).contains(clientX), (0...height).contains(clientY),
+          let scroll = browser["scroll"] as? [String: Any],
+          let scrollX = number(scroll, "x"), let scrollY = number(scroll, "y"),
+          let visual = browser["visualViewport"] as? [String: Any],
+          number(visual, "scale") == 1, number(visual, "offsetLeft") == 0, number(visual, "offsetTop") == 0,
+          let zoom = number(browser, "zoom"), (0.25...5).contains(zoom),
+          let dpr = number(browser, "devicePixelRatio"), dpr > 0,
+          region.display.scale.isFinite, region.display.scale > 0,
+          abs(dpr - region.display.scale * zoom) <= 0.01,
+          let window = browser["window"] as? [String: Any], boolean(window["focused"], equals: true),
+          let state = window["state"] as? String, ["normal", "maximized"].contains(state),
+          let left = number(window, "left"), let top = number(window, "top"),
+          let outerWidth = number(window, "width"), let outerHeight = number(window, "height"),
+          let pageWindow = browser["pageWindow"] as? [String: Any],
+          let pageX = number(pageWindow, "screenX"), let pageY = number(pageWindow, "screenY"),
+          let pageWidth = number(pageWindow, "outerWidth"), let pageHeight = number(pageWindow, "outerHeight"),
+          pageWidth > 0, pageHeight > 0,
+          abs(pageX - left) <= 1, abs(pageY - top) <= 1,
+          abs(pageWidth - outerWidth) <= 1, abs(pageHeight - outerHeight) <= 1 else { return nil }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let date = formatter.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp)
+    // The reply is accepted within one second of the shortcut; the anchor is at most one second old.
+    guard let date, abs(date.timeIntervalSince(context.date)) <= 2 else { return nil }
+    let windowRect = CGRect(x: left, y: top, width: outerWidth, height: outerHeight)
+    let origin = CGPoint(x: screenX - clientX * zoom, y: screenY - clientY * zoom)
+    let contentRect = CGRect(x: origin.x, y: origin.y, width: width * zoom, height: height * zoom)
+    guard valid(windowRect), valid(contentRect), valid(region.display.bounds), valid(region.globalRect),
+          windowRect.insetBy(dx: -1, dy: -1).contains(contentRect),
+          region.display.bounds.contains(contentRect), contentRect.contains(region.globalRect) else { return nil }
+    let viewportRect = CGRect(x: (region.globalRect.minX - origin.x) / zoom,
+                              y: (region.globalRect.minY - origin.y) / zoom,
+                              width: region.globalRect.width / zoom, height: region.globalRect.height / zoom)
+    let documentRect = viewportRect.offsetBy(dx: scrollX, dy: scrollY)
+    guard valid(viewportRect), valid(documentRect) else { return nil }
+    return PageRegionEstimate(origin: origin, viewportRect: viewportRect, documentRect: documentRect, anchorAgeMs: age)
 }
 
 final class Bridge {
@@ -415,6 +489,13 @@ final class Bridge {
     }
     func receive(_ message: [String: Any]) {
         if message["type"] as? String == "enabled", let value = message["enabled"] as? Bool { setEnabled(value); return }
+        if enabled, message["type"] as? String == "browser-geometry-invalidated" {
+            gestureContext?.geometryInvalidated = true
+            let changed = regionContext?.geometryInvalidated == false
+            regionContext?.geometryInvalidated = true
+            if changed { updatePreparedMarkdown() }
+            return
+        }
         guard enabled, message["type"] as? String == "browser-context",
               let id = message["requestId"] as? String else { return }
         if let context = gestureContext, id == context.id {
@@ -429,7 +510,7 @@ final class Bridge {
         if let context = browserObservation(message, app: observedApp) {
             browser = context
             // Do not delay paste for the browser; update a prepared context file when its reply arrives.
-            if let md = files?.last, let image = original { try? writeMarkdown(image, to: md) }
+            updatePreparedMarkdown()
         }
         requestID = nil
         tick()
@@ -457,9 +538,21 @@ final class Bridge {
                 "- Observed raw drag extent in this display's backing pixels: \(rect(region.displayPixelRect))",
                 "- Match: one clipboard change within 2 seconds of mouse-up; each image dimension differs from the raw drag extent by at most \(2 * region.display.scale) pixels (one logical point of rounding per edge). This is a heuristic tolerance, not a measured macOS rounding rule.",
                 "- Coordinate precision: raw pointer coordinates are preserved and may be fractional; they are not the exact image crop rectangle.",
-                "- Evidence limit: this is an observed drag matched by time and size, not a macOS capture receipt. It does not verify the source app, page, or crop origin.",
-                "- Web-page CSS coordinates: unknown; browser chrome, side panels, and zoom prevent deriving them from window bounds.",
-                "- Re-observe the live display before clicking; its layout may have changed."]
+                "- Evidence limit: this is an observed drag matched by time and size, not a macOS capture receipt. It does not verify the source app, page, or crop origin."]
+            if let estimate = estimatePageRegion(region, context: context) {
+                lines += [
+                    "- Estimated content viewport origin in global display points: x=\(estimate.origin.x), y=\(estimate.origin.y)",
+                    "- Estimated selection in viewport CSS pixels: \(rect(estimate.viewportRect))",
+                    "- Estimated selection in top-document CSS pixels: \(rect(estimate.documentRect))",
+                    "- Pointer anchor age at browser observation: \(estimate.anchorAgeMs) ms.",
+                    "- Estimation: recent pointer screen/client observation with browser zoom. Coordinates may be fractional; window agreement allows up to 1 display point of rounding. This estimates the raw drag, not the exact image crop, verified page provenance, or iframe-local coordinates."
+                ]
+            } else {
+                lines.append(context.geometryInvalidated
+                    ? "- Web-page CSS coordinates: unknown; browser geometry changed after the screenshot shortcut."
+                    : "- Web-page CSS coordinates: unknown; a fresh, stable pointer observation and unambiguous viewport/display mapping are required.")
+            }
+            lines.append("- Re-observe the live display before clicking; its layout may have changed.")
         } else if let regionDiagnostic {
             lines.append("- Last selection tracking status (may predate this image): \(regionDiagnostic)")
         }
@@ -488,6 +581,15 @@ final class Bridge {
     func writeMarkdown(_ image: ClipboardImage, to url: URL) throws {
         try Data(markdown(image).utf8).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+    func updatePreparedMarkdown() {
+        guard let md = files?.last, let image = original else { return }
+        do { try writeMarkdown(image, to: md) }
+        catch {
+            // Withdraw our prepared pair if its metadata can no longer be corrected.
+            if ownsClipboard() { restore() }
+            files = nil
+        }
     }
     func tick() {
         guard enabled else { return }
@@ -953,6 +1055,116 @@ func regionSelfTest() {
                     [RegionDisplay(id: 1, bounds: CGRect(x: 0.5, y: 0, width: 100, height: 100), scale: 1)]] {
         check(!armed(screens: screens).isArmed, "invalid display set")
     }
+    let pageDate = Date(timeIntervalSince1970: 2_000_000_000.125)
+    func pageContext(zoom: CGFloat = 1.25) -> GestureContext {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return GestureContext(id: "page-test", app: "com.google.Chrome", date: pageDate, time: 100, browser: [
+            "available": true, "pageAvailable": true, "url": "https://example.com/page", "fullscreen": false,
+            "zoom": zoom, "devicePixelRatio": 2 * zoom,
+            "viewport": ["width": 800 / zoom, "height": 400 / zoom],
+            "scroll": ["x": 17.25, "y": 500.5],
+            "visualViewport": ["scale": 1, "offsetLeft": 0, "offsetTop": 0],
+            "window": ["focused": true, "state": "normal", "left": 100, "top": 100, "width": 900, "height": 600],
+            "pageWindow": ["screenX": 100, "screenY": 100, "outerWidth": 900, "outerHeight": 600],
+            "pointerAnchor": ["screen": ["x": 140 + 100 * zoom, "y": 220 + 50 * zoom],
+                              "client": ["x": 100, "y": 50], "ageMs": 100,
+                              "observedAt": formatter.string(from: pageDate.addingTimeInterval(-0.1))]
+        ])
+    }
+    func pageRegion(_ rect: CGRect = CGRect(x: 340, y: 320, width: 200, height: 100),
+                    display: RegionDisplay = primary) -> RegionObservation {
+        RegionObservation(startedAt: 100, completedAt: 101, display: display, globalRect: rect,
+                          displayPixelRect: .zero)
+    }
+    func replacing(_ values: [String: Any], _ path: [String], _ value: Any?) -> [String: Any] {
+        var copy = values
+        if path.count == 1 { copy[path[0]] = value }
+        else { copy[path[0]] = replacing(copy[path[0]] as? [String: Any] ?? [:], Array(path.dropFirst()), value) }
+        return copy
+    }
+    func alteredPage(_ path: [String], _ value: Any?) -> GestureContext {
+        var context = pageContext()
+        context.browser = replacing(context.browser!, path, value)
+        return context
+    }
+    for zoom: CGFloat in [0.25, 0.5, 1, 1.1, 1.25, 2, 5] {
+        let estimate = estimatePageRegion(pageRegion(), context: pageContext(zoom: zoom))
+        check(estimate?.origin == CGPoint(x: 140, y: 220), "pointer anchor measures viewport origin across zoom")
+        check(estimate?.viewportRect == CGRect(x: 200 / zoom, y: 100 / zoom, width: 200 / zoom, height: 100 / zoom),
+              "raw drag maps to viewport CSS at normal and fractional zoom")
+        check(estimate?.documentRect == CGRect(x: 200 / zoom + 17.25, y: 100 / zoom + 500.5,
+                                               width: 200 / zoom, height: 100 / zoom), "scroll maps into top-document CSS")
+    }
+    let numericPaths = [["zoom"], ["devicePixelRatio"], ["pointerAnchor", "ageMs"],
+        ["pointerAnchor", "screen", "x"], ["pointerAnchor", "screen", "y"],
+        ["pointerAnchor", "client", "x"], ["pointerAnchor", "client", "y"],
+        ["viewport", "width"], ["viewport", "height"], ["scroll", "x"], ["scroll", "y"],
+        ["visualViewport", "scale"], ["visualViewport", "offsetLeft"], ["visualViewport", "offsetTop"],
+        ["window", "left"], ["window", "top"], ["window", "width"], ["window", "height"],
+        ["pageWindow", "screenX"], ["pageWindow", "screenY"], ["pageWindow", "outerWidth"], ["pageWindow", "outerHeight"]]
+    for path in numericPaths {
+        for invalid: Any? in [nil, true, "1", Double.nan, Double.infinity] {
+            check(estimatePageRegion(pageRegion(), context: alteredPage(path, invalid)) == nil,
+                  "missing, Boolean, string and nonfinite geometry values fail closed: \(path)")
+        }
+    }
+    for path in [["available"], ["pageAvailable"], ["fullscreen"], ["window", "focused"]] {
+        for invalid: Any? in [nil, 0, 1, "false"] {
+            check(estimatePageRegion(pageRegion(), context: alteredPage(path, invalid)) == nil, "explicit Boolean fields required")
+        }
+    }
+    for path in [["viewport", "width"], ["viewport", "height"], ["window", "width"], ["window", "height"],
+                 ["pageWindow", "outerWidth"], ["pageWindow", "outerHeight"]] {
+        check(estimatePageRegion(pageRegion(), context: alteredPage(path, 0)) == nil, "positive dimensions required")
+    }
+    for value: CGFloat in [0.249, 5.001] {
+        check(estimatePageRegion(pageRegion(), context: alteredPage(["zoom"], value)) == nil, "unsupported zoom rejected")
+    }
+    for value in [0, 1000] {
+        check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "ageMs"], value)) != nil, "inclusive anchor age limits")
+    }
+    for value in [-1, 1001] {
+        check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "ageMs"], value)) == nil, "stale or negative anchor age")
+    }
+    for value in ["invalid", iso(pageDate.addingTimeInterval(-3)), iso(pageDate.addingTimeInterval(3))] {
+        check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "observedAt"], value)) == nil,
+              "malformed, stale and future anchor timestamps rejected")
+    }
+    for (path, value): ([String], Any) in [(["fullscreen"], true), (["window", "state"], "fullscreen"),
+        (["visualViewport", "scale"], 1.01), (["visualViewport", "offsetLeft"], 0.1), (["visualViewport", "offsetTop"], -0.1),
+        (["devicePixelRatio"], 2.52), (["pointerAnchor", "client", "x"], -0.1),
+        (["pointerAnchor", "client", "y"], 321), (["pageWindow", "screenX"], 101.01),
+        (["pageWindow", "outerWidth"], 901.01), (["url"], "chrome://settings/")] {
+        check(estimatePageRegion(pageRegion(), context: alteredPage(path, value)) == nil, "unsupported or inconsistent mapping rejected")
+    }
+    check(estimatePageRegion(pageRegion(), context: alteredPage(["devicePixelRatio"], 2.509)) != nil, "small DPR float tolerance")
+    check(estimatePageRegion(pageRegion(), context: alteredPage(["pageWindow", "screenX"], 101)) != nil, "one-point window rounding accepted")
+    check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "screen", "x"], 224.5)) != nil,
+          "fractional viewport edge may round within one point of browser bounds")
+    check(estimatePageRegion(pageRegion(), context: alteredPage(["pointerAnchor", "screen", "x"], 223.9)) == nil,
+          "viewport beyond browser rounding tolerance rejected")
+    var outsideDisplay = alteredPage(["window", "left"], -200)
+    outsideDisplay.browser = replacing(outsideDisplay.browser!, ["pageWindow", "screenX"], -200)
+    outsideDisplay.browser = replacing(outsideDisplay.browser!, ["pointerAnchor", "screen", "x"], 124.5)
+    check(estimatePageRegion(pageRegion(), context: outsideDisplay) == nil, "whole viewport must be inside observed display")
+    for crop in [CGRect(x: 139.9, y: 320, width: 200, height: 100), CGRect(x: 900, y: 320, width: 200, height: 100),
+                 CGRect(x: 340, y: 200, width: 200, height: 100), CGRect(x: 340, y: 320, width: 0, height: 100)] {
+        check(estimatePageRegion(pageRegion(crop), context: pageContext()) == nil, "browser chrome, partial viewport and zero-area crops rejected")
+    }
+    var invalidated = pageContext()
+    invalidated.geometryInvalidated = true
+    check(estimatePageRegion(pageRegion(), context: invalidated) == nil, "geometry invalidation overrides otherwise valid browser data")
+    var negativePage = pageContext()
+    for (path, value): ([String], Double) in [(["window", "left"], -1820), (["window", "top"], -100),
+        (["pageWindow", "screenX"], -1820), (["pageWindow", "screenY"], -100),
+        (["pointerAnchor", "screen", "x"], -1655), (["pointerAnchor", "screen", "y"], 82.5), (["devicePixelRatio"], 1.25)] {
+        negativePage.browser = replacing(negativePage.browser!, path, value)
+    }
+    let negativeDisplay = RegionDisplay(id: 9, bounds: CGRect(x: -1920, y: -200, width: 1440, height: 900), scale: 1)
+    let negativeEstimate = estimatePageRegion(pageRegion(CGRect(x: -1580, y: 120, width: 200, height: 100), display: negativeDisplay),
+                                              context: negativePage)
+    check(negativeEstimate?.viewportRect == CGRect(x: 160, y: 80, width: 160, height: 80), "negative-origin secondary display mapping")
     print("PASS: \(checks) passive region state checks; no event tap, UI, screenshot, or clipboard access")
 }
 
@@ -1123,11 +1335,14 @@ func selfTest() throws {
         bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
                         "pageAvailable": false, "pageUnavailableReason": reason, "url": url, "title": "Observed tab",
                         "viewport": ["width": 999], "scroll": ["y": 999], "devicePixelRatio": 2,
+                        "pointerAnchor": ["screen": ["x": 10, "y": 10]],
+                        "pageWindow": ["outerWidth": 1200], "fullscreen": false,
                         "window": ["focused": true, "left": -1200, "top": 40, "width": 1200, "height": 800]])
         let partial = bridge.markdown(bridge.original!)
         assert(partial.contains(quoted(url)) && partial.contains("Observed tab") && partial.contains("-1200"))
         assert(partial.contains("Page measurements: unavailable") && !partial.contains("Viewport (CSS px)"))
         assert(partial.contains("Screenshot source and crop origin: unknown"))
+        assert(bridge.browser?["pointerAnchor"] == nil && bridge.browser?["pageWindow"] == nil && bridge.browser?["fullscreen"] == nil)
     }
     for url in ["file:///private/screenshot.png", "javascript:alert(1)", "data:text/html,private", "chrome:extensions"] {
         app = "com.google.Chrome"; putImage(); bridge.tick()
@@ -1142,13 +1357,15 @@ func selfTest() throws {
     bridge.displays = { [RegionDisplay(id: 7, bounds: CGRect(x: -100, y: -50, width: 500, height: 400), scale: 1)] }
     func startSelection(replyBeforeEnd: Bool = false,
                         start: CGPoint = CGPoint(x: -80, y: -20),
-                        end: CGPoint = CGPoint(x: -76, y: -17)) -> String {
+                        end: CGPoint = CGPoint(x: -76, y: -17),
+                        beforeMouseDown: ((String) -> Void)? = nil) -> String {
         bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
         now += 10
         bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
         assert(bridge.gesture.isArmed && bridge.gestureContext?.app == app)
         let id = requested
         if replyBeforeEnd { bridge.receive(selectionReply(id)) }
+        beforeMouseDown?(id)
         bridge.observeGesture(type: .flagsChanged, flags: [])
         bridge.observeGesture(type: .leftMouseDown, flags: [], location: start)
         bridge.observeGesture(type: .leftMouseDragged, flags: [], location: CGPoint(x: -78.25, y: -18.75))
@@ -1159,6 +1376,19 @@ func selfTest() throws {
     func selectionReply(_ id: String, url: String = "https://example.com/source-a") -> [String: Any] {
         ["type": "browser-context", "requestId": id, "available": true, "url": url,
          "observedAt": iso(Date()), "window": ["focused": true]]
+    }
+    func pageReply(_ id: String) -> [String: Any] {
+        var reply = selectionReply(id)
+        reply["pageAvailable"] = true; reply["fullscreen"] = false
+        reply["zoom"] = 1; reply["devicePixelRatio"] = 1
+        reply["viewport"] = ["width": 400, "height": 300]
+        reply["scroll"] = ["x": 11, "y": 100]
+        reply["visualViewport"] = ["scale": 1, "offsetLeft": 0, "offsetTop": 0]
+        reply["window"] = ["focused": true, "state": "normal", "left": -90, "top": -40, "width": 450, "height": 350]
+        reply["pageWindow"] = ["screenX": -90, "screenY": -40, "outerWidth": 450, "outerHeight": 350]
+        reply["pointerAnchor"] = ["screen": ["x": -70, "y": -15], "client": ["x": 20, "y": 10],
+                                  "ageMs": 50, "observedAt": iso(bridge.gestureContext!.date.addingTimeInterval(-0.05))]
+        return reply
     }
     _ = startSelection(replyBeforeEnd: true)
     // Clear and delayed fill have one change count. The later foreground app is not the source.
@@ -1217,6 +1447,96 @@ func selfTest() throws {
     assert(mismatchMD.contains("- Last selection tracking status (may predate this image):") && mismatchMD.contains("rounding tolerance"))
     assert(!mismatchMD.contains("Observed raw drag extent"))
     bridge.setEnabled(false)
+
+    let invalidate: [String: Any] = ["type": "browser-geometry-invalidated"]
+    for stage in ["before-reply", "after-reply", "after-mouse-up", "after-file-write"] {
+        _ = startSelection(beforeMouseDown: { id in
+            if stage == "before-reply" { bridge.receive(invalidate) }
+            var reply = pageReply(id)
+            reply["geometryInvalidated"] = false // Reply data cannot erase an independent invalidation.
+            bridge.receive(reply)
+            if stage == "after-reply" { bridge.receive(invalidate) }
+        })
+        if stage == "after-mouse-up" { bridge.receive(invalidate) }
+        putImage(); app = "com.openai.codex"; bridge.tick()
+        let paths = bridge.files!, before = board.changeCount
+        if stage == "after-file-write" {
+            let estimatedMD = try String(contentsOf: paths[1], encoding: .utf8)
+            assert(estimatedMD.contains("Estimated selection in viewport CSS pixels: x=10.0, y=5.0, width=4.0, height=3.0"))
+            assert(estimatedMD.contains("Estimated selection in top-document CSS pixels: x=21.0, y=105.0, width=4.0, height=3.0"))
+            assert(estimatedMD.contains("recent pointer") && estimatedMD.contains("up to 1 display point"))
+            bridge.receive(invalidate)
+        }
+        let invalidatedMD = try String(contentsOf: paths[1], encoding: .utf8)
+        assert(!invalidatedMD.contains("Estimated selection") && invalidatedMD.contains("browser geometry changed"), stage)
+        assert(bridge.region != nil && bridge.regionContext?.geometryInvalidated == true)
+        assert(bridge.regionContext?.browser?["pointerAnchor"] != nil && bridge.browser?["url"] as? String == "https://example.com/source-a")
+        assert(invalidatedMD.contains("Observed raw drag extent") && invalidatedMD.contains("source-a"))
+        let preservedImage = try Data(contentsOf: paths[0])
+        assert(preservedImage == png && board.changeCount == before, "Invalidation only rewrites metadata")
+        bridge.receive(invalidate)
+        assert(board.changeCount == before, "Duplicate invalidation does not write clipboard")
+    }
+    // A new gesture has its own invalidation flag, even without toggling the product.
+    app = "com.google.Chrome"; bridge.tick(); now += 10
+    bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
+    assert(bridge.gesture.isArmed && bridge.gestureContext?.geometryInvalidated == false)
+    bridge.receive(pageReply(requested))
+    assert(bridge.gestureContext?.browser?["pointerAnchor"] != nil && bridge.gestureContext?.geometryInvalidated == false)
+    bridge.cancelGesture()
+    _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) })
+    putImage(); app = "com.openai.codex"; bridge.tick()
+    let offMDPath = bridge.files![1], offMD = try Data(contentsOf: bridge.files![1])
+    bridge.setEnabled(false)
+    let offClipboardCount = board.changeCount
+    bridge.receive(invalidate)
+    let afterOffMD = try Data(contentsOf: offMDPath)
+    assert(afterOffMD == offMD && board.changeCount == offClipboardCount, "OFF ignores geometry notifications")
+    var afterImageReply: [String: Any] = [:]
+    _ = startSelection(beforeMouseDown: { afterImageReply = pageReply($0) })
+    putImage(); app = "com.openai.codex"; bridge.tick()
+    bridge.receive(afterImageReply)
+    assert(bridge.region != nil && bridge.regionContext?.browser == nil)
+    assert(!bridge.markdown(bridge.original!).contains("Estimated selection"), "Post-image browser context cannot supply CSS coordinates")
+    bridge.setEnabled(false)
+    func blockPreparedRewrite() throws -> [URL] {
+        let paths = bridge.files!
+        try FileManager.default.moveItem(at: paths[1], to: paths[1].appendingPathExtension("saved"))
+        try FileManager.default.createDirectory(at: paths[1], withIntermediateDirectories: false)
+        return paths
+    }
+    for ownershipLost in [false, true] {
+        _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) })
+        putImage(); app = "com.openai.codex"; bridge.tick()
+        let stalePaths = try blockPreparedRewrite()
+        if ownershipLost { board.clearContents(); board.setString("newer user copy", forType: .string) }
+        let beforeFailure = board.changeCount
+        bridge.receive(invalidate)
+        assert(bridge.files == nil && !bridge.ownsClipboard(), "Failed correction must withdraw the stale prepared pair")
+        if ownershipLost {
+            assert(board.changeCount == beforeFailure && board.string(forType: .string) == "newer user copy",
+                   "Failed correction must preserve a newer clipboard owner")
+        } else {
+            assert(board.data(forType: .png) == png && board.pasteboardItems?.count == 1,
+                   "Failed correction restores our original image instead of offering stale CSS metadata")
+            bridge.tick()
+            assert(bridge.ownsClipboard() && bridge.files != stalePaths, "Next tick prepares a fresh pair")
+            let correctedMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
+            assert(!correctedMD.contains("Estimated selection") && correctedMD.contains("browser geometry changed"))
+        }
+        assert(FileManager.default.fileExists(atPath: stalePaths[1].appendingPathExtension("saved").path),
+               "Historical files must remain on disk")
+    }
+    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true); putImage(); bridge.tick()
+    let lateRewriteID = requested
+    app = "com.openai.codex"; bridge.tick()
+    let staleLatePaths = try blockPreparedRewrite()
+    bridge.receive(selectionReply(lateRewriteID, url: "https://example.com/late-corrected"))
+    assert(bridge.ownsClipboard() && bridge.files != staleLatePaths, "Late browser updates share the same failure recovery")
+    let correctedLateMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
+    assert(correctedLateMD.contains("late-corrected"))
+    bridge.setEnabled(false)
+    print("PASS: page CSS estimates, reply/invalidation races, failed-rewrite withdrawal, raw observation preservation, and OFF/new-gesture isolation.")
 
     var permissionRequests = 0, inputStates: [String] = []
     let monitor = RegionInputMonitor(bridge: bridge, preflight: { false },

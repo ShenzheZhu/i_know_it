@@ -7,6 +7,13 @@ const pause = () => new Promise(resolve => setTimeout(resolve, 90));
 function event() { return { listeners: [], addListener(fn) { this.listeners.push(fn); }, async emit(...args) { await Promise.all(this.listeners.map(fn => fn(...args))); } }; }
 const messages = [];
 const broadcasts = [];
+const pageUpdates = [];
+const openPages = [
+  { id: 4, url: 'https://example.com/settings', incognito: false },
+  { id: 6, url: 'http://example.com/background', incognito: false },
+  { id: 8, url: 'https://private.example/', incognito: true },
+  { id: 9, url: 'chrome://settings/' }, { id: 10, url: 'file:///private/page.html' },
+];
 const titles = [];
 let settings = { enabled: true };
 let saveSettings = async (value) => { settings = value; };
@@ -29,10 +36,16 @@ const chrome = {
   action: { async setBadgeText() {}, async setTitle({ title }) { titles.push(title); }, onClicked: event() },
   alarms: { async create(_name, options) { assert.equal(options.periodInMinutes, 0.5); }, onAlarm: event() },
   windows: { WINDOW_ID_NONE: -1, async getLastFocused() { return structuredClone(window); }, onFocusChanged: event(), onBoundsChanged: event() },
-  tabs: { async getZoom() { return 1.25; }, onActivated: event(), onRemoved: event(), onUpdated: event(), onZoomChange: event() },
+  tabs: { async query(options) { assert.deepEqual(Object.keys(options), []); return structuredClone(openPages); },
+    async sendMessage(tabId, message, options) {
+      assert.equal(options.frameId, 0);
+      pageUpdates.push({ tabId, ...message });
+      if (tabId === 6) throw new Error('Tab has no content script');
+    }, async getZoom() { return 1.25; }, onActivated: event(), onRemoved: event(), onUpdated: event(), onZoomChange: event() },
   scripting: { async executeScript() { reads++; return injected(); } },
 };
 const popupSender = { id: chrome.runtime.id, url: chrome.runtime.getURL('popup.html') };
+const pageSender = { id: chrome.runtime.id, frameId: 0, tab: { id: 4, active: true, incognito: false }, url: 'https://example.com/settings' };
 function popup(message, sender = popupSender) {
   return new Promise(resolve => {
     const keepAlive = chrome.runtime.onMessage.listeners[0](message, sender, resolve);
@@ -44,6 +57,16 @@ vm.runInContext(source, sandbox);
 (async () => {
   await vm.runInContext('ready', sandbox);
   await pause();
+  assert.deepEqual(pageUpdates, [4, 6].map(tabId => ({ tabId, type: 'page-state', enabled: true })),
+    'Startup must update only HTTP(S), non-private top-level pages, tolerating a missing content script');
+  assert.equal((await popup({ type: 'get-page-state' }, pageSender)).enabled, true);
+  assert.equal((await popup({ type: 'get-page-state' }, { ...pageSender, tab: { ...pageSender.tab, active: false } })).enabled, true,
+    'An inactive page needs the authoritative live switch state too');
+  for (const sender of [null, {}, popupSender, { ...pageSender, id: 'foreign-extension' },
+    { ...pageSender, frameId: 1 }, { ...pageSender, frameId: undefined }, { ...pageSender, tab: null },
+    { ...pageSender, tab: { ...pageSender.tab, incognito: true } }, { ...pageSender, url: 'file:///private/page.html' }]) {
+    assert.equal(await popup({ type: 'get-page-state' }, sender), undefined, 'Reject unauthenticated page-state readers');
+  }
   assert.equal(messages[0].type, 'enabled');
   assert.equal(messages[0].enabled, true);
   assert.equal(messages.at(-1).available, true);
@@ -100,6 +123,8 @@ vm.runInContext(source, sandbox);
   assert.equal(messages.at(-1).url, window.tabs[0].url);
   await popup({ type: 'set-enabled', enabled: false });
   assert.equal(settings.enabled, false);
+  assert.equal((await popup({ type: 'get-page-state' }, pageSender)).enabled, false);
+  assert(pageUpdates.slice(-2).every(update => update.enabled === false), 'OFF must reach existing content scripts');
   assert.equal(titles.at(-1), 'I Know It! — Off');
   assert.equal(messages.at(-1).enabled, false);
   await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
@@ -130,15 +155,16 @@ vm.runInContext(source, sandbox);
   };
   const rapid = await Promise.all([
     popup({ type: 'set-enabled', enabled: false }), popup({ type: 'set-enabled', enabled: true }),
-    popup({ type: 'set-enabled', enabled: true }), popup({ type: 'get-state' }),
+    popup({ type: 'set-enabled', enabled: true }), popup({ type: 'get-state' }), popup({ type: 'get-page-state' }, pageSender),
   ]);
-  assert.deepEqual(rapid.map(reply => reply.enabled), [false, true, true, true]);
+  assert.deepEqual(rapid.map(reply => reply.enabled), [false, true, true, true, true]);
   await pause();
   assert.equal(settings.enabled, true, 'Rapid explicit state changes must persist the final enabled state');
   assert.equal(maximumWrites, 1, 'Popup state writes must not overlap');
   assert.equal(totalWrites, 2, 'A duplicate explicit state must not write storage again');
   assert.equal(messages.filter(message => message.type === 'enabled').length, beforeRapid + 2);
   assert.equal(messages.filter(message => message.type === 'enabled').at(-1).enabled, true);
+  assert(pageUpdates.slice(-2).every(update => update.enabled === true), 'Serialized toggles must leave all pages in their final state');
   saveSettings = async (value) => { settings = value; };
   const normalInjection = injected;
   let completeRead;
@@ -451,6 +477,31 @@ vm.runInContext(source, sandbox);
   await permissionPause();
   assert.equal(connections.length, permissionConnections, 'An unexpected disconnect must clear a pending permission return');
 
+  const invalidations = () => messages.filter(message => message.type === 'browser-geometry-invalidated').length;
+  for (const trigger of [
+    () => chrome.tabs.onActivated.emit(), () => chrome.tabs.onRemoved.emit(),
+    () => chrome.tabs.onZoomChange.emit(), () => chrome.windows.onBoundsChanged.emit(),
+    () => chrome.tabs.onUpdated.emit(4, { status: 'loading' }, { active: true }),
+    () => chrome.tabs.onUpdated.emit(4, { url: 'https://example.com/next' }, { active: true }),
+    () => chrome.runtime.onMessage.emit({ type: 'context-changed', geometryChanged: true }, pageSender),
+  ]) {
+    const before = invalidations();
+    await trigger();
+    assert.equal(invalidations(), before + 1, 'A geometry transition must invalidate pending native page coordinates');
+  }
+  const beforeNonGeometry = invalidations();
+  await chrome.windows.onFocusChanged.emit(chrome.windows.WINDOW_ID_NONE);
+  await chrome.windows.onFocusChanged.emit(window.id);
+  await chrome.tabs.onUpdated.emit(4, { title: 'Updated title' }, { active: true });
+  await chrome.tabs.onUpdated.emit(6, { status: 'loading' }, { active: false });
+  await chrome.runtime.onMessage.emit({ type: 'context-changed', geometryChanged: false }, pageSender);
+  for (const sender of [
+    { ...pageSender, id: 'foreign' }, { ...pageSender, frameId: 1 },
+    { ...pageSender, tab: { ...pageSender.tab, active: false } },
+    { ...pageSender, tab: { ...pageSender.tab, incognito: true } },
+  ]) await chrome.runtime.onMessage.emit({ type: 'context-changed', geometryChanged: true }, sender);
+  assert.equal(invalidations(), beforeNonGeometry, 'Focus, title-only changes, inactive tabs, and forged page signals must not invalidate geometry');
+  await pause();
   const beforeForged = reads;
   await chrome.runtime.onMessage.emit({ type: 'context-changed' }, { id: 'other-extension', frameId: 0, tab: { active: true }, url: 'https://example.com/' });
   await chrome.runtime.onMessage.emit({ type: 'context-changed' }, { id: 'extension-id', frameId: 1, tab: { active: true }, url: 'https://example.com/' });
@@ -498,6 +549,14 @@ vm.runInContext(source, sandbox);
   saveSettings = async () => { throw new Error('Storage write failed'); };
   await assert.doesNotReject(() => popup({ type: 'set-enabled', enabled: false }), 'Failed persistence must not break the live switch');
   assert.equal(connection.messages.at(-1).enabled, false);
+  assert.equal((await popup({ type: 'get-page-state' }, pageSender)).enabled, false,
+    'A page must read live OFF even when storage still says ON');
+  assert(pageUpdates.slice(-2).every(update => update.enabled === false), 'Failed persistence must not prevent page OFF propagation');
+  const disabledInvalidations = messages.filter(message => message.type === 'browser-geometry-invalidated').length;
+  await chrome.windows.onBoundsChanged.emit();
+  await chrome.runtime.onMessage.emit({ type: 'context-changed', geometryChanged: true }, pageSender);
+  assert.equal(messages.filter(message => message.type === 'browser-geometry-invalidated').length, disabledInvalidations,
+    'OFF must suppress geometry invalidation signals as well as page reads');
   connection.closed = true;
   await connection.onDisconnect.emit();
   const disconnectedCount = connections.length;
@@ -512,7 +571,9 @@ vm.runInContext(source, sandbox);
 
   const handlers = {};
   const contentMessages = [];
-  const page = { url: 'https://example.com/', title: 'Example', visibility: 'visible', width: 1200, height: 800, x: 0, y: 0, ratio: 2, scale: 1, offsetLeft: 0, offsetTop: 0 };
+  const page = { url: 'https://example.com/', title: 'Example', visibility: 'visible', width: 1200, height: 800,
+    x: 0, y: 0, ratio: 2, scale: 1, offsetLeft: 0, offsetTop: 0, screenX: -1280, screenY: 40,
+    outerWidth: 1240, outerHeight: 900, focused: true, fullscreen: false, pointerLock: false };
   function listen(target, name, handler, options) {
     if (target !== 'document') assert.equal(options?.passive, true);
     handlers[`${target}:${name}`] = handler;
@@ -520,6 +581,9 @@ vm.runInContext(source, sandbox);
   const noWrite = { set() { assert.fail('The content reporter must not modify page objects'); } };
   const document = new Proxy({
     get title() { return page.title; }, get visibilityState() { return page.visibility; },
+    get fullscreenElement() { return page.fullscreen ? {} : null; },
+    get pointerLockElement() { return page.pointerLock ? {} : null; },
+    hasFocus() { return page.focused; },
     addEventListener(name, handler, options) { listen('document', name, handler, options); },
   }, noWrite);
   const viewport = new Proxy({
@@ -527,21 +591,34 @@ vm.runInContext(source, sandbox);
     addEventListener(name, handler, options) { listen('viewport', name, handler, options); },
   }, noWrite);
   let interval;
-  const contentChrome = { runtime: { sendMessage(message) { contentMessages.push(message); return Promise.resolve(); } } };
-  const content = { document, visualViewport: viewport, chrome: contentChrome,
+  let now = 1000;
+  let resolveInitialState;
+  const stateRequests = [];
+  const contentChrome = { runtime: { id: chrome.runtime.id, onMessage: event(), sendMessage(message) {
+    if (message.type === 'get-page-state') { stateRequests.push(message); return new Promise(resolve => { resolveInitialState = resolve; }); }
+    contentMessages.push(message); return Promise.resolve();
+  } } };
+  const content = { document, visualViewport: viewport, chrome: contentChrome, performance: { now: () => now },
     location: new Proxy({ get href() { return page.url; } }, noWrite),
     history: new Proxy(Object.freeze({ pushState() {}, replaceState() {} }), noWrite),
     addEventListener(name, handler, options) { listen('window', name, handler, options); },
     setInterval(handler, milliseconds) { assert.equal(milliseconds, 1000); interval = handler; },
   };
-  for (const [name, key] of Object.entries({ innerWidth: 'width', innerHeight: 'height', scrollX: 'x', scrollY: 'y', devicePixelRatio: 'ratio' })) {
-    Object.defineProperty(content, name, { get() { return page[key]; }, set: noWrite.set });
+  for (const [name, key] of Object.entries({ innerWidth: 'width', innerHeight: 'height', scrollX: 'x', scrollY: 'y', devicePixelRatio: 'ratio', screenX: 'screenX', screenY: 'screenY', outerWidth: 'outerWidth', outerHeight: 'outerHeight' })) {
+    Object.defineProperty(content, name, { enumerable: true, get() { return page[key]; }, set: noWrite.set });
   }
   const originalHistory = content.history.pushState;
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'context.js'), 'utf8'), vm.createContext(content));
-  assert.equal(contentMessages.length, 1);
+  assert.equal(stateRequests.length, 1);
+  assert.deepEqual(Object.keys(stateRequests[0]), ['type']);
+  assert.equal(contentMessages.length, 0, 'Content must start OFF until it receives the live state');
+  await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: true }, { id: chrome.runtime.id });
+  resolveInitialState({ enabled: false });
+  await Promise.resolve();
+  assert.equal(contentMessages.length, 1, 'A delayed initial state must not override a newer live toggle');
   assert.equal(contentMessages[0].type, 'context-changed');
-  assert.deepEqual(Object.keys(contentMessages[0]), ['type'], 'Only a change signal should leave the content script');
+  assert.deepEqual(Object.keys(contentMessages[0]), ['type', 'geometryChanged'], 'Only a geometry change signal should leave the content script');
+  assert.equal(contentMessages[0].geometryChanged, true);
   interval();
   handlers['window:scroll']();
   assert.equal(contentMessages.length, 1, 'Unchanged metadata should not produce duplicate signals');
@@ -561,6 +638,7 @@ vm.runInContext(source, sandbox);
   page.title = 'Account';
   interval();
   assert.equal(contentMessages.length, 8, 'SPA URL and title changes must be detected');
+  assert.equal(contentMessages.at(-1).geometryChanged, false, 'A title change is not a coordinate change');
   page.visibility = 'hidden';
   page.url = 'https://example.com/private';
   handlers['document:visibilitychange']();
@@ -570,8 +648,117 @@ vm.runInContext(source, sandbox);
   handlers['document:visibilitychange']();
   assert.equal(contentMessages.length, 9);
   assert.equal(content.history.pushState, originalHistory);
+  const readPage = () => content.__iKnowItPageContext();
+  const point = (overrides = {}) => ({ isTrusted: true, pointerType: 'mouse', buttons: 0,
+    ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, timeStamp: now,
+    screenX: -1179.75, screenY: 159.5, clientX: 100.25, clientY: 20.5, ...overrides });
+  const move = overrides => handlers['window:pointermove'](point(overrides));
+  const restorePage = () => { now = 1000; page.visibility = 'visible'; page.focused = true; page.pointerLock = false; };
+  move();
+  let anchor = readPage().pointerAnchor;
+  assert.deepEqual(JSON.parse(JSON.stringify(anchor.screen)), { x: -1179.75, y: 159.5 });
+  assert.deepEqual(JSON.parse(JSON.stringify(anchor.client)), { x: 100.25, y: 20.5 });
+  assert.equal(anchor.ageMs, 0);
+  assert(Number.isFinite(Date.parse(anchor.observedAt)));
+  now = 2000;
+  assert.equal(readPage().pointerAnchor.ageMs, 1000, 'The one-second anchor boundary is inclusive');
+  now = 2000.25;
+  assert.equal(readPage().pointerAnchor, undefined, 'A stale anchor must not leave the page');
+  restorePage(); move(); now = 999.75;
+  assert.equal(readPage().pointerAnchor, undefined, 'A clock reversal must not expose an anchor');
+  restorePage(); move(); page.focused = false;
+  assert(readPage().pointerAnchor, 'Focus loss alone during the system screenshot overlay must retain a recent anchor');
+  assert.equal(handlers['window:blur'], undefined);
+  assert.equal(handlers['window:focus'], undefined);
+  restorePage();
+
+  for (const invalid of [
+    { isTrusted: false }, { pointerType: 'touch' }, { pointerType: 'pen' }, { buttons: 1 },
+    { ctrlKey: true }, { altKey: true }, { shiftKey: true }, { metaKey: true },
+    { timeStamp: 899.75 }, { timeStamp: 1000.25 }, { timeStamp: NaN },
+    { screenX: Infinity }, { screenY: NaN }, { clientX: -Infinity }, { clientY: NaN },
+  ]) {
+    move(); assert(readPage().pointerAnchor);
+    move(invalid);
+    assert.equal(readPage().pointerAnchor, undefined, `Reject invalid pointer observation ${JSON.stringify(invalid)}`);
+  }
+  for (const invalid of ['hidden', 'unfocused', 'pointer-lock', 'invalid-clock']) {
+    restorePage(); move();
+    if (invalid === 'hidden') page.visibility = 'hidden';
+    if (invalid === 'unfocused') page.focused = false;
+    if (invalid === 'pointer-lock') page.pointerLock = true;
+    if (invalid === 'invalid-clock') now = NaN;
+    move();
+    assert.equal(readPage().pointerAnchor, undefined, invalid);
+  }
+  restorePage(); move({ timeStamp: 900 });
+  assert.equal(readPage().pointerAnchor.ageMs, 100, 'A pointer event at the freshness boundary is accepted');
+
+  for (const [key, next, eventName] of [
+    ['width', 900, 'window:resize'], ['height', 600, 'window:resize'], ['x', -15.25, 'window:scroll'],
+    ['y', 1000.5, 'window:scroll'], ['ratio', 1.25, 'window:resize'],
+    ['scale', 1.25, 'viewport:resize'], ['offsetLeft', 12.5, 'viewport:scroll'], ['offsetTop', 7.25, 'viewport:scroll'],
+    ['screenX', -1024.5, null], ['screenY', 100.25, null], ['outerWidth', 1000, 'window:resize'],
+    ['outerHeight', 780, 'window:resize'], ['fullscreen', true, 'document:fullscreenchange'],
+    ['url', 'https://example.com/elsewhere', 'window:popstate'],
+  ]) {
+    const old = page[key];
+    move(); assert(readPage().pointerAnchor);
+    page[key] = next;
+    assert.equal(readPage().pointerAnchor, undefined, `${key} drift must reject an anchor before the event callback`);
+    (eventName ? handlers[eventName] : interval)();
+    assert.equal(contentMessages.at(-1).geometryChanged, true, `${key} must report geometry invalidation`);
+    page[key] = old;
+    (eventName ? handlers[eventName] : interval)();
+    assert.equal(readPage().pointerAnchor, undefined, 'Restoring geometry must not revive an invalidated anchor');
+  }
+  move(); page.title = 'A title-only update'; interval();
+  assert(readPage().pointerAnchor, 'A title-only update must retain its anchor');
+  assert.equal(contentMessages.at(-1).geometryChanged, false);
+  page.visibility = 'hidden'; handlers['document:visibilitychange']();
+  page.visibility = 'visible'; handlers['document:visibilitychange']();
+  assert.equal(readPage().pointerAnchor, undefined, 'Hiding and reopening a page must not revive an anchor');
+
+  for (const sender of [{ id: 'foreign-extension' }, { id: chrome.runtime.id, tab: { id: 4 } }]) {
+    move();
+    await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: false }, sender);
+    assert(readPage().pointerAnchor, 'Page and foreign senders cannot change the live switch');
+  }
+  await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: false }, { id: chrome.runtime.id });
+  const offSignals = contentMessages.length;
+  page.y++; interval(); move();
+  assert.equal(readPage().pointerAnchor, undefined, 'OFF must clear and stop collecting pointer observations');
+  assert.equal(contentMessages.length, offSignals, 'OFF must stop metadata change signals');
+  await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: true }, { id: chrome.runtime.id });
+  assert.equal(readPage().pointerAnchor, undefined, 'Turning ON must not revive an old anchor');
+  move(); assert(readPage().pointerAnchor);
+  for (const message of contentMessages) {
+    assert.deepEqual(Object.keys(message), ['type', 'geometryChanged'], 'Signals must never contain pointer coordinates, URLs, or DOM data');
+    assert.equal(typeof message.geometryChanged, 'boolean');
+  }
+  sandbox.__iKnowItPageContext = () => readPage();
+  const extracted = vm.runInContext('pageContext()', sandbox);
+  assert.equal(extracted.pointerAnchor.screen.x, -1179.75, 'Background extraction must call the isolated page context function');
+  assert.equal(extracted.pageWindow.screenX, -1280);
+  delete sandbox.__iKnowItPageContext;
   contentChrome.runtime.sendMessage = () => { throw new Error('Extension context invalidated'); };
   page.y++;
   assert.doesNotThrow(() => handlers['window:scroll'](), 'An unloaded extension must not throw errors into the page');
-  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
+  for (const initialState of [true, false, 'unavailable', 'rejected', 'throw']) {
+    const startupSignals = [];
+    const startupContent = { ...content, addEventListener() {}, setInterval() {}, chrome: { runtime: {
+      id: chrome.runtime.id, onMessage: event(), sendMessage(message) {
+        if (message.type !== 'get-page-state') { startupSignals.push(message); return Promise.resolve(); }
+        if (initialState === 'throw') throw new Error('Extension was unloaded');
+        if (initialState === 'rejected') return Promise.reject(new Error('Worker was unavailable'));
+        return Promise.resolve(initialState === 'unavailable' ? undefined : { enabled: initialState });
+      },
+    } } };
+    assert.doesNotThrow(() => vm.runInContext(fs.readFileSync(path.join(__dirname, 'context.js'), 'utf8'), vm.createContext(startupContent)));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(startupSignals.length, initialState === true ? 1 : 0,
+      'Only an authoritative initial ON reply may enable page reporting');
+  }
+  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; authoritative page state and failed-storage toggle propagation; trusted/recent/fractional pointer anchors, stale/synthetic/hidden/OFF/geometry rejection; metadata-only signals without DOM writes; geometry invalidation without focus-only cancellation; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

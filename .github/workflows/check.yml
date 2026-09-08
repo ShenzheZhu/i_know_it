@@ -25,6 +25,10 @@ jobs:
         env:
           NODE_PATH: ${{ runner.temp }}/iki-popup/node_modules
         run: node check-popup.cjs
+      - name: Isolated content-script integration
+        env:
+          NODE_PATH: ${{ runner.temp }}/iki-popup/node_modules
+        run: xvfb-run --auto-servernum node check-context-browser.cjs
   macos:
     strategy:
       fail-fast: false

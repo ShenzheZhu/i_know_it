@@ -61,6 +61,20 @@ For an automated artifact check using Codex CLI, run `node check-agent.cjs` with
 
 On September 8, 2026, this check passed: Codex CLI read the image code, observed URL, 1200 × 800 dimensions, and unknown crop origin correctly. Additional regression checks found and fixed stale screenshots being reapplied after clipboard ownership loss and old replies reaching a replacement native connection. Extension invalidation also now leaves passive page handlers silent. Malformed input, message-size limits, late replies, disabling, and reconnect checks pass. Native Codex desktop acceptance is still blocked by the available automation policy; a CLI result does not prove the desktop paste flow.
 
+The extended checks can be run without accessing Codex desktop or the everyday Chrome profile:
+
+```sh
+node check-process.cjs
+node check-images.cjs
+node check-install.cjs
+```
+
+`check-process.cjs` runs the native executable with only its pasteboard, app observation, and support directory redirected to fixtures. It checks split pipe messages, EOF, SIGTERM, SIGINT, malformed input, OFF, a newer copy during shutdown, a broken output pipe, and a competing host. `check-images.cjs` checks byte preservation and metadata for nine sizes from 1 × 1 to 7680 × 4320, plus rejection of a valid image above the 64-million-pixel limit. `check-install.cjs` runs real Swift compilation and registration commands inside a temporary Application Support tree, covering reinstallation, validation, permissions, failures, foreign files, symlinks, and uninstall retention.
+
+The native self-test also covers 4,096 deterministic state transitions (seed `0x494B49`). This reproduced and fixed an older image being reapplied after a duplicate enable message. Extension checks cover fractional zoom/viewport offsets, closed or navigating tabs, changing incognito flags, and storage failures. If Chrome cannot read saved settings, the extension starts OFF; a storage write failure does not disable the live switch, but persistence remains unavailable until a later write succeeds.
+
+GitHub Actions runs the extension, native state, process, image-size, and installer checks on macOS 14 (Apple silicon) and macOS 15 (Intel) for every push and pull request. These jobs use private pasteboards and temporary installation directories; they do not need a Codex account or control a desktop agent.
+
 ## License
 
 MIT.

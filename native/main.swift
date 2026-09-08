@@ -97,6 +97,7 @@ final class Bridge {
         seen = board.changeCount
     }
     func setEnabled(_ value: Bool) {
+        guard value != enabled else { return }
         enabled = value
         if !value { restore(); original = nil; files = nil; browser = nil; requestID = nil }
         seen = board.changeCount
@@ -376,6 +377,66 @@ func selfTest() throws {
     let input = try FileHandle(forReadingFrom: frameFile)
     let first = readMessage(from: input), second = readMessage(from: input), end = readMessage(from: input); try input.close()
     assert(first != nil && second?["enabled"] as? Bool == false && end == nil)
+    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true); putImage(); bridge.tick()
+    board.clearContents(); board.setString("copy before duplicate enable", forType: .string)
+    bridge.receive(["type": "enabled", "enabled": true]); app = "com.openai.codex"; bridge.tick()
+    assert(board.string(forType: .string) == "copy before duplicate enable", "Duplicate enable resurrected an older screenshot")
+
+    bitmap.setColor(NSColor(deviceRed: 1, green: 0, blue: 0, alpha: 1), atX: 0, y: 0)
+    let variants = [png, bitmap.representation(using: .png, properties: [:])!]
+    var random: UInt64 = 0x494B49
+    func next(_ limit: Int) -> Int {
+        random ^= random << 13; random ^= random >> 7; random ^= random << 17
+        return Int(random % UInt64(limit))
+    }
+    for sequence in 0..<64 {
+        var generation = 0, imageIndex: Int?, expectedText = "sequence-\(sequence)-initial", foreground = "com.google.Chrome"
+        var replies: [[String: Any]] = []
+        board.clearContents(); board.setString(expectedText, forType: .string)
+        let state = Bridge(board: board, directory: directory.appendingPathComponent("sequence-\(sequence)"), currentApp: { foreground }, request: { id in
+            replies.append(["type": "browser-context", "requestId": id, "available": true,
+                            "url": "https://example.com/image/\(generation)", "window": ["focused": true]])
+        })
+        for step in 0..<64 {
+            let action = next(12), wasDisabled = !state.enabled, before = board.changeCount
+            switch action {
+            case 0: state.receive(["type": "enabled", "enabled": true])
+            case 1: state.receive(["type": "enabled", "enabled": false])
+            case 2, 3:
+                generation += 1; imageIndex = action - 2
+                board.clearContents(); board.setData(variants[imageIndex!], forType: .png)
+            case 4:
+                generation += 1; imageIndex = nil; expectedText = "sequence-\(sequence)-copy-\(generation)"
+                board.clearContents(); board.setString(expectedText, forType: .string)
+            case 5: foreground = "com.google.Chrome"; state.tick()
+            case 6: foreground = "com.openai.codex"; state.tick()
+            case 7: foreground = "com.apple.TextEdit"; state.tick()
+            case 8: if !replies.isEmpty { state.receive(replies[next(replies.count)]) }
+            case 9: state.tick(); state.tick()
+            case 10: state.restore()
+            default:
+                state.receive(["type": "enabled", "enabled": true]); state.receive(["type": "enabled", "enabled": true])
+            }
+            let label = "seed=0x494B49 sequence=\(sequence) step=\(step) action=\(action)"
+            if wasDisabled && !state.enabled && ![2, 3, 4].contains(action) {
+                assert(board.changeCount == before, "Disabled bridge wrote: \(label)")
+            }
+            if state.ownsClipboard() {
+                assert(state.enabled && foreground == "com.openai.codex" && imageIndex != nil, "Unexpected attachment: \(label)")
+                let bytes = try Data(contentsOf: state.files![0]), text = try String(contentsOf: state.files![1], encoding: .utf8)
+                assert(bytes == variants[imageIndex!], "Older image resurrected: \(label)")
+                if text.contains("- Page URL:") {
+                    assert(text.contains(quoted("https://example.com/image/\(generation)")), "Context belongs to an older copy: \(label)")
+                }
+            } else if let imageIndex {
+                assert(board.data(forType: .png) == variants[imageIndex], "Image bytes changed: \(label)")
+            } else {
+                assert(board.string(forType: .string) == expectedText, "Newer text lost: \(label)")
+            }
+        }
+        state.setEnabled(false)
+    }
+    print("PASS: 64 deterministic state sequences × 64 actions (4096 transitions), seed=0x494B49.")
     print("PASS: image preservation, malformed/oversized/concealed input, native framing limits, stale replies, immediate attachment, late context, restore/toggle/newer-copy ownership, and disk failure.")
 }
 

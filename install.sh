@@ -2,7 +2,7 @@
 set -euo pipefail
 
 [[ "$(uname -s)" == Darwin ]] || { echo "This installer requires macOS." >&2; exit 1; }
-extension_id="${1:-nfpnjhfbdogjiafeiioapfdnfaboehkh}"
+extension_id="${1-nfpnjhfbdogjiafeiioapfdnfaboehkh}"
 [[ $# -le 1 && "$extension_id" =~ ^[a-p]{32}$ ]] || {
   echo "Usage: ./install.sh [32-character Chrome extension ID]" >&2
   exit 1

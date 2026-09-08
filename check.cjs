@@ -136,6 +136,51 @@ vm.runInContext(source, sandbox);
   await pause();
   assert.equal(messages.at(-1).available, false);
   assert.equal(messages.at(-1).url, undefined);
+  const getWindow = chrome.windows.getLastFocused;
+  const getZoom = chrome.tabs.getZoom;
+  const originalWindow = structuredClone(window);
+  for (const failure of ['window-read', 'no-active-tab', 'closed-window', 'zoom', 'script', 'same-tab-navigation', 'current-incognito', 'current-tab-incognito']) {
+    window = structuredClone(originalWindow);
+    chrome.windows.getLastFocused = getWindow;
+    chrome.tabs.getZoom = getZoom;
+    injected = normalInjection;
+    if (failure === 'window-read') chrome.windows.getLastFocused = async () => { throw new Error('Window unavailable'); };
+    if (failure === 'no-active-tab') window.tabs = [];
+    if (failure === 'closed-window') window = undefined;
+    if (failure === 'zoom') chrome.tabs.getZoom = async () => { throw new Error('Tab closed'); };
+    if (failure === 'script') injected = async () => { throw new Error('Cannot access page'); };
+    if (failure === 'same-tab-navigation') injected = async () => { const result = await normalInjection(); window.tabs[0].url = 'https://example.com/next'; return result; };
+    if (failure === 'current-incognito') injected = async () => { const result = await normalInjection(); window.incognito = true; return result; };
+    if (failure === 'current-tab-incognito') injected = async () => { const result = await normalInjection(); window.tabs[0].incognito = true; return result; };
+    await connection.onMessage.emit({ type: 'request-context', requestId: failure });
+    await pause();
+    const reply = messages.find(message => message.requestId === failure);
+    assert.equal(reply.available, false, failure);
+    for (const field of ['url', 'title', 'viewport', 'scroll', 'devicePixelRatio', 'zoom', 'visualViewport']) {
+      assert.equal(reply[field], undefined, `${failure} must omit ${field}`);
+    }
+  }
+  window = originalWindow;
+  chrome.windows.getLastFocused = getWindow;
+  chrome.tabs.getZoom = async () => 0.9;
+  Object.assign(sandbox, { location: { href: window.tabs[0].url }, document: { title: 'Fractional display' },
+    innerWidth: 1066, innerHeight: 733, scrollX: -47.125, scrollY: -0.375, devicePixelRatio: 1.25,
+    visualViewport: { scale: 1.125, offsetLeft: -2.75, offsetTop: 13.5 },
+  });
+  injected = async () => [{ frameId: 0, result: vm.runInContext('pageContext()', sandbox) }];
+  await connection.onMessage.emit({ type: 'request-context', requestId: 'fractional' });
+  await pause();
+  const fractional = messages.find(message => message.requestId === 'fractional');
+  assert.equal(fractional.available, true);
+  assert.equal(fractional.devicePixelRatio, 1.25);
+  assert.equal(fractional.zoom, 0.9);
+  assert.equal(fractional.scroll.x, -47.125);
+  assert.equal(fractional.scroll.y, -0.375);
+  assert.equal(fractional.visualViewport.scale, 1.125);
+  assert.equal(fractional.visualViewport.offsetLeft, -2.75);
+  assert.equal(fractional.visualViewport.offsetTop, 13.5);
+  chrome.tabs.getZoom = getZoom;
+  injected = normalInjection;
   const beforeForged = reads;
   await chrome.runtime.onMessage.emit({ type: 'context-changed' }, { id: 'other-extension', frameId: 0, tab: { active: true }, url: 'https://example.com/' });
   await chrome.runtime.onMessage.emit({ type: 'context-changed' }, { id: 'extension-id', frameId: 1, tab: { active: true }, url: 'https://example.com/' });
@@ -160,6 +205,40 @@ vm.runInContext(source, sandbox);
   await pause();
   assert.equal(connection.messages[0].enabled, false);
   assert.equal(reads, beforeForged, 'A disabled reconnect must not read page context');
+
+  connection.closed = true;
+  await connection.onDisconnect.emit();
+  for (const namespace of Object.values(chrome)) {
+    for (const value of Object.values(namespace)) if (value?.listeners) value.listeners.length = 0;
+  }
+  const getSettings = chrome.storage.local.get;
+  chrome.storage.local.get = async () => { throw new Error('Storage temporarily unavailable'); };
+  const unavailableStorage = vm.createContext({ chrome, setTimeout, clearTimeout, console });
+  vm.runInContext(source, unavailableStorage);
+  await assert.doesNotReject(async () => { await vm.runInContext('ready', unavailableStorage); },
+    'Storage read failure must initialize a usable, disabled extension');
+  await pause();
+  assert.equal(connection.messages[0].enabled, false);
+  assert.equal(reads, beforeForged);
+  chrome.storage.local.get = getSettings;
+  await chrome.action.onClicked.emit();
+  await pause();
+  assert.equal(settings.enabled, true);
+  assert.equal(connection.messages.at(-1).available, true, 'The first click after failed storage initialization must work');
+  saveSettings = async () => { throw new Error('Storage write failed'); };
+  await assert.doesNotReject(() => chrome.action.onClicked.emit(), 'Failed persistence must not break the live switch');
+  assert.equal(connection.messages.at(-1).enabled, false);
+  connection.closed = true;
+  await connection.onDisconnect.emit();
+  const disconnectedCount = connections.length;
+  await assert.doesNotReject(() => chrome.action.onClicked.emit());
+  await pause();
+  assert.equal(connections.length, disconnectedCount + 1, 'Failed persistence must not prevent reconnecting the live switch');
+  assert.equal(connection.messages[0].enabled, true);
+  assert.equal(connection.messages.at(-1).available, true);
+  saveSettings = async (value) => { settings = value; };
+  await chrome.action.onClicked.emit();
+  assert.equal(settings.enabled, false, 'Persistence must recover on the next successful write');
 
   const handlers = {};
   const contentMessages = [];
@@ -224,5 +303,5 @@ vm.runInContext(source, sandbox);
   contentChrome.runtime.sendMessage = () => { throw new Error('Extension context invalidated'); };
   page.y++;
   assert.doesNotThrow(() => handlers['window:scroll'](), 'An unloaded extension must not throw errors into the page');
-  console.log('PASS: fresh correlated context; negative display coordinates; zoom; persisted toggle; serialized rapid toggles; disabled startup/reconnect; pending reads across OFF; host disconnect/reconnect isolation; passive content events and unchanged page; no reads while off; focus loss; tab race; restricted pages; forged/iframe messages rejected.');
+  console.log('PASS: fresh/correlated context; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; rapid toggles and disabled startup/reconnect; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

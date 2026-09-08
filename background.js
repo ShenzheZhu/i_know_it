@@ -49,8 +49,8 @@ async function readContext(version, requestId) {
       const current = await chrome.windows.getLastFocused({ populate: true });
       const active = current.tabs?.find((item) => item.active);
       const page = results.find((item) => item.frameId === 0)?.result;
-      if (current.focused && current.id === window.id && active?.id === tab.id
-        && active.status === 'complete' && active.url === tab.url && page?.url === tab.url
+      if (current.focused && !current.incognito && current.id === window.id && active?.id === tab.id
+        && !active.incognito && active.status === 'complete' && active.url === tab.url && page?.url === tab.url
         && ['left', 'top', 'width', 'height', 'state'].every((key) => current[key] === window[key])) {
         context = { ...context, ...page, observedAt, available: true, zoom };
       } else {
@@ -99,7 +99,7 @@ function updateButton() {
   ]);
 }
 
-const ready = chrome.storage.local.get({ enabled: true }).then(async (settings) => {
+const ready = chrome.storage.local.get({ enabled: true }).catch(() => ({ enabled: false })).then(async (settings) => {
   enabled = settings.enabled !== false;
   await updateButton();
   await chrome.alarms.create('native-reconnect', { periodInMinutes: 0.5 });
@@ -113,7 +113,7 @@ chrome.action.onClicked.addListener(() => {
     revision++;
     clearTimeout(timer);
     send({ type: 'enabled', enabled });
-    await Promise.all([chrome.storage.local.set({ enabled }), updateButton()]);
+    await Promise.all([chrome.storage.local.set({ enabled }).catch(() => {}), updateButton()]);
     connect();
     if (enabled) refresh(true);
   });

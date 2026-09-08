@@ -92,7 +92,7 @@ const server = http.createServer((_request, response) => {
     const browserSession = await browser.newBrowserCDPSession();
     const installed = await browserSession.send('Extensions.loadUnpacked', { path: extension, enableInIncognito: false });
     const workerURL = `chrome-extension://${installed.id}/`;
-    const worker = context.serviceWorkers().find(worker => worker.url().startsWith(workerURL))
+    let worker = context.serviceWorkers().find(worker => worker.url().startsWith(workerURL))
       || await context.waitForEvent('serviceworker', { predicate: worker => worker.url().startsWith(workerURL) });
     await worker.evaluate(async () => { await __contextTest.ready; });
     const tabId = await worker.evaluate(async url => (await chrome.tabs.query({})).find(tab => tab.url === url)?.id, page.url());
@@ -287,29 +287,45 @@ const server = http.createServer((_request, response) => {
       } });
     }, tabId);
     const workerBeforeReload = await worker.evaluate(() => performance.timeOrigin);
-    await worker.evaluate(() => { setTimeout(() => chrome.runtime.reload(), 100); });
-    // Playwright keeps the same Worker across MV3 restarts; wait for a fresh context.
-    // https://github.com/microsoft/playwright/pull/39476
+    const closedWorkers = new Set();
+    const trackWorker = candidate => candidate.once('close', () => closedWorkers.add(candidate));
+    context.serviceWorkers().forEach(trackWorker);
+    context.on('serviceworker', trackWorker);
+    // MV3 idle restart can reuse a handle; whole-extension reload can detach it.
+    // Discover the current worker by extension identity, not a new-object event.
     const reloadDeadline = Date.now() + 10_000;
     let readyTimeout;
     try {
+      await worker.evaluate(() => { setTimeout(() => chrome.runtime.reload(), 100); });
       await Promise.race([
         (async () => {
           while (Date.now() < reloadDeadline) {
-            let restartedAt;
-            try {
-              restartedAt = await worker.evaluate(async before => {
-                if (performance.timeOrigin === before) return before;
-                await __contextTest.ready;
-                return performance.timeOrigin;
-              }, workerBeforeReload);
-            } catch (error) {
-              if (!/Service worker restarted|Execution context was destroyed/.test(error.message)) throw error;
-            }
-            if (restartedAt !== undefined && restartedAt !== workerBeforeReload) {
-              assert(Number.isFinite(restartedAt) && restartedAt > workerBeforeReload,
-                'runtime.reload must start a newer worker execution context');
-              return;
+            assert(browser.isConnected() && !page.isClosed(), 'The fixture browser and page must survive extension reload');
+            for (const candidate of context.serviceWorkers()) {
+              if (closedWorkers.has(candidate)) continue;
+              let observed;
+              try {
+                observed = await candidate.evaluate(async ({ id, before }) => {
+                  const extensionId = globalThis.chrome?.runtime?.id;
+                  const startedAt = performance.timeOrigin;
+                  if (extensionId === id && startedAt > before) await __contextTest.ready;
+                  return { extensionId, startedAt };
+                }, { id: installed.id, before: workerBeforeReload });
+              } catch (error) {
+                const detached = closedWorkers.has(candidate) || !context.serviceWorkers().includes(candidate);
+                const transition = /Service worker restarted|Execution context was destroyed/.test(error.message)
+                  || (detached && /Target page, context or browser has been closed/.test(error.message));
+                if (!transition || !browser.isConnected() || page.isClosed()) throw error;
+                continue;
+              }
+              if (observed.extensionId !== installed.id) continue;
+              assert(Number.isFinite(observed.startedAt) && observed.startedAt >= workerBeforeReload,
+                'The extension worker must expose a valid execution-context start time');
+              if (observed.startedAt > workerBeforeReload) {
+                console.log(JSON.stringify({ check: 'extension-reload-worker', before: workerBeforeReload,
+                  after: observed.startedAt, handleReplaced: candidate !== worker, closedWorkers: closedWorkers.size }));
+                worker = candidate; return;
+              }
             }
             await delay(100);
           }
@@ -317,7 +333,19 @@ const server = http.createServer((_request, response) => {
         })(),
         new Promise((_, reject) => { readyTimeout = setTimeout(() => reject(new Error('Reloaded extension did not become ready within 10 seconds')), 10_000); }),
       ]);
-    } finally { clearTimeout(readyTimeout); }
+    } catch (error) {
+      console.error(JSON.stringify({ check: 'extension-reload-failed', error: error.message,
+        browserConnected: browser.isConnected(), pageClosed: page.isClosed(), closedWorkers: closedWorkers.size,
+        workers: context.serviceWorkers().map(candidate => ({ url: candidate.url(), closed: closedWorkers.has(candidate) })) }));
+      const inventory = await Promise.race([
+        Promise.allSettled([browserSession.send('Target.getTargets'), browserSession.send('Extensions.getExtensions'),
+          page.evaluate(() => ({ url: location.href, timeOrigin: performance.timeOrigin }))])
+          .then(results => results.map(result => result.status === 'rejected' ? { status: 'rejected', reason: String(result.reason) } : result)),
+        delay(2000).then(() => 'Diagnostic inventory timed out after 2 seconds'),
+      ]);
+      console.error(JSON.stringify({ check: 'extension-reload-inventory', inventory }));
+      throw error;
+    } finally { clearTimeout(readyTimeout); context.off('serviceworker', trackWorker); }
     const reloadedCollector = await worker.evaluate(async id => {
       const results = await chrome.scripting.executeScript({ target: { tabId: id }, func: () => ({
         oldMarker: globalThis.__contextBeforeReload === true,

@@ -109,14 +109,37 @@ const server = http.createServer((_request, response) => {
     assert.equal(restoredGeometry.restored.pointerAnchor, undefined, 'Returning to identical geometry without intervening events cannot resurrect calibration');
     await seed();
     await page.mouse.move(-20, -20);
-    const otherPage = await context.newPage();
-    await otherPage.bringToFront();
-    // requestAnimationFrame polling stops in a hidden tab; keep this real visibility check timer-based.
-    await page.waitForFunction(() => document.visibilityState === 'hidden', undefined, { polling: 100, timeout: 10_000 });
-    await otherPage.close();
-    await page.bringToFront();
-    await page.waitForFunction(() => document.visibilityState === 'visible', undefined, { polling: 100, timeout: 10_000 });
-    assert.equal((await read()).pointerAnchor, undefined, 'Hiding and reopening the real fixture tab must clear calibration');
+    // Playwright enables focus emulation on each page, keeping background pages visible.
+    // Disable that harness override only for this real, same-window tab visibility check.
+    const visibilitySession = await context.newCDPSession(page);
+    const logVisibility = async stage => console.log(JSON.stringify({ check: 'real-tab-visibility', stage,
+      document: await page.evaluate(() => ({ visibility: document.visibilityState, focused: document.hasFocus() })),
+      tabs: await worker.evaluate(async id => {
+        const { windowId } = await chrome.tabs.get(id);
+        return (await chrome.tabs.query({ windowId })).map(({ id, active }) => ({ id, active }));
+      }, tabId),
+    }));
+    let otherTab;
+    try {
+      await visibilitySession.send('Emulation.setFocusEmulationEnabled', { enabled: false });
+      otherTab = await worker.evaluate(async id => {
+        const { windowId } = await chrome.tabs.get(id);
+        return chrome.tabs.create({ windowId, active: true, url: 'about:blank' });
+      }, tabId);
+      await logVisibility('switched-away');
+      // Animation-frame polling pauses in a hidden tab; use a bounded real-state timer.
+      await page.waitForFunction(() => document.visibilityState === 'hidden', undefined, { polling: 100, timeout: 10_000 });
+      await worker.evaluate(id => chrome.tabs.update(id, { active: true }), tabId);
+      await page.waitForFunction(() => document.visibilityState === 'visible', undefined, { polling: 100, timeout: 10_000 });
+      await logVisibility('returned');
+      assert.equal((await read()).pointerAnchor, undefined, 'Hiding and reopening the real fixture tab must clear calibration');
+    } catch (error) {
+      await logVisibility('failed');
+      throw error;
+    } finally {
+      if (otherTab) await worker.evaluate(id => chrome.tabs.remove(id), otherTab.id);
+      await visibilitySession.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    }
     await seed();
     await page.evaluate(() => document.dispatchEvent(new Event('freeze')));
     await page.mouse.move(200, 200);

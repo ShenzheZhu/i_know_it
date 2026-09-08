@@ -95,13 +95,13 @@ vm.runInContext(source, sandbox);
     { type: 'set-enabled', enabled: 'false' }, { type: 'set-enabled', enabled: null },
     { type: 'set-enabled', enabled: 0 }]) assert.equal(await popup(message), undefined);
   assert.equal(messages.length, controlBaseline, 'Duplicate state and rejected messages must not affect the host');
-  await popup({ type: 'request-input-access' });
+  assert.equal((await popup({ type: 'request-input-access' })).permissionRequestSent, false);
   assert.equal(messages.length, controlBaseline, 'A disconnected companion must not receive permission requests');
   for (const status of ['ready', 'unavailable', 'off']) {
     await connection.onMessage.emit({ type: 'input-status', status });
     assert.equal((await popup({ type: 'get-state' })).inputStatus, status);
     assert.equal(broadcasts.at(-1).inputStatus, status);
-    await popup({ type: 'request-input-access' });
+    assert.equal((await popup({ type: 'request-input-access' })).permissionRequestSent, false);
     assert.equal(messages.length, controlBaseline, `${status} must not request permission`);
   }
   await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
@@ -113,7 +113,7 @@ vm.runInContext(source, sandbox);
     assert.equal(await popup({ type: 'request-input-access' }, sender), undefined);
   }
   assert.equal(messages.length, controlBaseline, 'Forged callers cannot request permission even when required');
-  await popup({ type: 'request-input-access' });
+  assert.equal((await popup({ type: 'request-input-access' })).permissionRequestSent, true);
   assert.equal(messages.at(-1).type, 'request-input-access');
   assert.equal(messages.filter(message => message.type === 'request-input-access').length, 1);
   assert.equal((await popup({ type: 'get-state' })).enabled, true);
@@ -128,7 +128,7 @@ vm.runInContext(source, sandbox);
   assert.equal(titles.at(-1), 'I Know It! — Off');
   assert.equal(messages.at(-1).enabled, false);
   await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
-  await popup({ type: 'request-input-access' });
+  assert.equal((await popup({ type: 'request-input-access' })).permissionRequestSent, false);
   assert.equal(messages.filter(message => message.type === 'request-input-access').length, 1, 'OFF must suppress permission requests');
   const disabledReads = reads;
   await connection.onMessage.emit({ type: 'request-context', requestId: 'off' });
@@ -416,12 +416,13 @@ vm.runInContext(source, sandbox);
   assert.equal(connections.length, permissionConnections, 'Startup, ON, polling and forged requests must not arm a permission restart');
 
   connection.closed = true;
-  await popup({ type: 'request-input-access' });
+  assert.equal((await popup({ type: 'request-input-access' })).permissionRequestSent, false,
+    'Failed native sends must return an explicit failure to the popup');
   connection.closed = false;
   await returnToChrome();
   assert.equal(connections.length, permissionConnections, 'A failed permission message must not arm a restart');
 
-  await popup({ type: 'request-input-access' });
+  assert.equal((await popup({ type: 'request-input-access' })).permissionRequestSent, true);
   await chrome.windows.onFocusChanged.emit(window.id);
   await chrome.tabs.onActivated.emit();
   await chrome.windows.onBoundsChanged.emit();

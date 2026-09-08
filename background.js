@@ -216,11 +216,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     || sender?.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('popup.html')
     || sender.tab !== undefined || (message.type === 'set-enabled' && typeof message.enabled !== 'boolean')) return;
   const operation = message.type === 'set-enabled' ? setEnabled(message.enabled) : changing.then(() => {
-    if (message.type === 'request-input-access' && enabled && inputStatus === 'permission-required') {
-      if (send({ type: 'request-input-access' })) permissionReturn = { blurred: false };
+    if (message.type === 'request-input-access') {
+      const permissionRequestSent = enabled && inputStatus === 'permission-required'
+        && send({ type: 'request-input-access' });
+      if (permissionRequestSent) permissionReturn = { blurred: false };
+      return { ...state(), permissionRequestSent };
     }
     return state();
   });
-  void operation.then(sendResponse, () => sendResponse(state())).catch(() => {});
+  void operation.then(sendResponse, () => sendResponse({ ...state(),
+    ...(message.type === 'request-input-access' && { permissionRequestSent: false }),
+  })).catch(() => {});
   return true;
 });

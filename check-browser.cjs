@@ -4,8 +4,8 @@ const root=__dirname, output=process.env.IKI_RUN_DIR || fs.mkdtempSync(path.join
 fs.mkdirSync(output,{recursive:true});
 cp.execFileSync('/usr/bin/xcrun',['swiftc',path.join(root,'native/clipboard-check.swift'),'-o',path.join(output,'clipboard-fixture')]);
 const extension=path.join(output,'extension');fs.mkdirSync(extension,{recursive:true});
-for(const file of ['manifest.json','context.js'])fs.copyFileSync(path.join(root,file),path.join(extension,file));
-fs.writeFileSync(path.join(extension,'background.js'),fs.readFileSync(path.join(root,'background.js'),'utf8')+'\nglobalThis.__test={ready,get port(){return port},get toggling(){return toggling}};\n');
+for(const file of ['manifest.json','context.js','popup.html','popup.js'])fs.copyFileSync(path.join(root,file),path.join(extension,file));
+fs.writeFileSync(path.join(extension,'background.js'),fs.readFileSync(path.join(root,'background.js'),'utf8')+'\nglobalThis.__test={ready,get port(){return port}};\n');
 const profile=fs.mkdtempSync(path.join(output,'profile-'));
 const key=Buffer.from(JSON.parse(fs.readFileSync(path.join(root,'manifest.json'))).key,'base64');
 const id=[...crypto.createHash('sha256').update(key).digest().subarray(0,16)].map(x=>String.fromCharCode(97+(x>>4),97+(x&15))).join('');
@@ -42,21 +42,7 @@ const server=http.createServer((req,res)=>{res.setHeader('Content-Type','text/ht
  assert.deepEqual(pasted.map(f=>f.name),['screenshot.png','context.md']);
  for(const f of pasted) assert.equal(digest(Buffer.from(f.bytes)),digest(fs.readFileSync(path.join(output,f.name))));
  await stopFixture();
- const cdp=await context.browser().newBrowserCDPSession();
- const targets=await cdp.send('Target.getTargets',{filter:[{type:'tab'}]});
- const target=targets.targetInfos.find(t=>t.url===url);assert(target);
- const pageCount=context.pages().length;
- await cdp.send('Extensions.triggerAction',{id,targetId:target.targetId});
- await worker.evaluate(async()=>{await __test.toggling;});
- assert.equal(await worker.evaluate(async()=>(await chrome.storage.local.get('enabled')).enabled),false);
- assert.equal(await worker.evaluate(()=>chrome.action.getBadgeText({})), 'OFF');
- assert.equal(context.pages().length,pageCount);
- await cdp.send('Extensions.triggerAction',{id,targetId:target.targetId});
- await worker.evaluate(async()=>{await __test.toggling;});
- assert.equal(await worker.evaluate(async()=>(await chrome.storage.local.get('enabled')).enabled),true);
- assert.equal(await worker.evaluate(()=>chrome.action.getBadgeText({})), 'ON');
- assert.equal(context.pages().length,pageCount);
- const result={date:new Date().toISOString(),browser:context.browser().version(),extensionId:id,checks:['Real native host requests and receives browser context','Native macOS file URLs paste as PNG and Markdown in one ordinary Meta+V','PNG and Markdown bytes preserved','Toolbar OFF/ON persisted with badge and no new tab'],nativeCodexGUI:'Not executed: automation channel denies Codex app control',claudeCode:'Not verified'};
+ const result={date:new Date().toISOString(),browser:context.browser().version(),extensionId:id,checks:['Real native host requests and receives browser context','Native macOS file URLs paste as PNG and Markdown in one ordinary Meta+V','PNG and Markdown bytes preserved'],nativeCodexGUI:'Not executed: automation channel denies Codex app control',claudeCode:'Not verified'};
  fs.writeFileSync(path.join(output,'results.json'),JSON.stringify(result,null,2)+'\n');console.log(JSON.stringify(result,null,2));
  }finally{if(fixture){fixture.stdin.end('\n');await new Promise(r=>fixture.once('exit',r));}await context.close();server.close();}
 })().catch(e=>{console.error(e);server.close();process.exitCode=1;});

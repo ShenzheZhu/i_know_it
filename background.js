@@ -95,7 +95,7 @@ function connect() {
 function updateButton() {
   return Promise.all([
     chrome.action.setBadgeText({ text: enabled ? 'ON' : 'OFF' }),
-    chrome.action.setTitle({ title: `I Know It! — ${enabled ? 'On. Click to turn off.' : 'Off. Click to turn on.'}` }),
+    chrome.action.setTitle({ title: `I Know It! — ${enabled ? 'On' : 'Off'}` }),
   ]);
 }
 
@@ -106,20 +106,22 @@ const ready = chrome.storage.local.get({ enabled: true }).catch(() => ({ enabled
   connect();
 });
 
-let toggling = ready;
-chrome.action.onClicked.addListener(() => {
-  const operation = toggling.then(async () => {
-    enabled = !enabled;
+let changing = ready;
+function setEnabled(value) {
+  const operation = changing.then(async () => {
+    if (enabled === value) { connect(); return { enabled }; }
+    enabled = value;
     revision++;
     clearTimeout(timer);
     send({ type: 'enabled', enabled });
     await Promise.all([chrome.storage.local.set({ enabled }).catch(() => {}), updateButton()]);
     connect();
     if (enabled) refresh(true);
+    return { enabled };
   });
-  toggling = operation.catch(() => {});
+  changing = operation.catch(() => {});
   return operation;
-});
+}
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'native-reconnect') { await ready; connect(); }
 });
@@ -133,8 +135,15 @@ chrome.tabs.onUpdated.addListener((_id, changes, tab) => {
 chrome.tabs.onZoomChange.addListener(() => refresh());
 chrome.windows.onFocusChanged.addListener(() => refresh(true));
 chrome.windows.onBoundsChanged.addListener(() => refresh(true));
-chrome.runtime.onMessage.addListener((message, sender) => {
-  if (message?.type === 'context-changed' && sender.id === chrome.runtime.id
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'context-changed' && sender?.id === chrome.runtime.id
     && sender.frameId === 0 && sender.tab?.active && !sender.tab.incognito
     && /^https?:\/\//.test(sender.url ?? '')) refresh();
+  if ((message?.type !== 'get-state' && message?.type !== 'set-enabled')
+    || sender?.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('popup.html')
+    || sender.tab !== undefined || (message.type === 'set-enabled' && typeof message.enabled !== 'boolean')) return;
+  const operation = message.type === 'get-state'
+    ? changing.then(() => ({ enabled })) : setEnabled(message.enabled);
+  void operation.then(sendResponse, () => sendResponse({ enabled })).catch(() => {});
+  return true;
 });

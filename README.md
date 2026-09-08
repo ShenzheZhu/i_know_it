@@ -1,6 +1,6 @@
 # I Know It!
 
-Keep your usual screenshot and paste workflow. A Chrome extension and a small macOS companion prepare the original image and a Markdown context file for pasting into Codex desktop. Click the extension's toolbar button to switch **ON / OFF**. The choice survives browser restarts.
+Keep your usual screenshot and paste workflow. A Chrome extension and a small macOS companion prepare the original image and a Markdown context file for pasting into Codex desktop. Click the extension's toolbar button to open a small panel with an **ON / OFF** switch. The choice survives browser restarts.
 
 This is an experimental macOS implementation. Chrome transport and clipboard behavior are tested; the native Codex composer has not been tested interactively. Other agent platforms, including Claude Code terminals, are not yet supported.
 
@@ -16,7 +16,7 @@ The public manifest key keeps the extension ID stable. The installer registers a
 
 ## Use
 
-Take a screenshot with your existing tool. Copy it and paste as usual into Codex desktop. There is no new screenshot shortcut, selection overlay, preview page, popup, toast, notification, or image annotation.
+Take a screenshot with your existing tool. Copy it and paste as usual into Codex desktop. There is no new screenshot shortcut, selection overlay, preview page, toast, notification, or image annotation. The switch panel appears only when you click the extension icon; taking a screenshot and pasting remain silent.
 
 With the switch **ON**, a single clipboard image is prepared as two local file attachments while Codex is foreground: `screenshot.png` and `context.md`. Codex's inspected paste handler accepts an image and a nonempty Markdown file together; the Markdown is a file attachment/context reference, not inline text. The actual native composer flow still needs acceptance testing.
 
@@ -51,11 +51,13 @@ xcrun swiftc native/main.swift -o /tmp/i-know-it-check
 /tmp/i-know-it-check --self-test
 ```
 
-The extension check covers correlated context, zoom and negative window coordinates, focus/tab races, restricted pages, persisted switches, rapid clicks, and disabled restarts. The native check uses an isolated named pasteboard to exercise original-image preservation, destination changes, toggle restoration, late context, and newer-copy ownership. It does not touch the system clipboard.
+The extension check covers correlated context, zoom and negative window coordinates, focus/tab races, restricted pages, persisted switches, rapid setting changes, and disabled restarts. The native check uses an isolated named pasteboard to exercise original-image preservation, destination changes, toggle restoration, late context, and newer-copy ownership. It does not touch the system clipboard.
+
+With Playwright and its Chromium browser available, run `node check-popup.cjs` to check the switch panel. It loads the actual popup HTML and background JavaScript in an isolated local fixture and covers clicking, keyboard control, saved state, interrupted replies, light/dark themes, and narrow widths. This check does not install the extension, touch the system clipboard, or establish native Codex composer acceptance.
 
 A separate integration check is available as `node check-browser.cjs` after installing the companion and making Playwright with Chrome for Testing available. It uses a separate browser profile and an instrumented copy of the extension. It temporarily writes fixture file URLs to the system clipboard, pastes into a local test page, and restores the prior clipboard only if no newer copy replaced it. Close other loaded instances of this extension before running it because only one native connection can own the clipboard bridge.
 
-The September 7, 2026 run on macOS 26.6.2 / Chrome for Testing 151.0.7922.34 verified a real native-host context request, an ordinary paste containing both PNG and Markdown with identical bytes, and toolbar ON/OFF without a new tab. This does not establish native Codex composer acceptance.
+The September 7, 2026 run on macOS 26.6.2 / Chrome for Testing 151.0.7922.34 verified a real native-host context request and an ordinary paste containing both PNG and Markdown with identical bytes. This does not establish native Codex composer acceptance.
 
 For an automated artifact check using Codex CLI, run `node check-agent.cjs` with Playwright and an authenticated `codex` command available. Set `CODEX_BINARY` if the CLI is installed elsewhere. This calls Codex with a generated test image, so normal account usage applies. The check compiles the real native clipboard engine with a private-pasteboard fixture, verifies byte preservation and Retina dimensions, and asks Codex to read a random visual code and the generated Markdown. It never opens Codex desktop or changes the system clipboard.
 
@@ -73,7 +75,7 @@ node check-install.cjs
 
 The native self-test also covers 4,096 deterministic state transitions (seed `0x494B49`). This reproduced and fixed an older image being reapplied after a duplicate enable message. Extension checks cover fractional zoom/viewport offsets, closed or navigating tabs, changing incognito flags, and storage failures. If Chrome cannot read saved settings, the extension starts OFF; a storage write failure does not disable the live switch, but persistence remains unavailable until a later write succeeds.
 
-GitHub Actions runs the extension, native state, process, image-size, and installer checks on macOS 14 (Apple silicon) and macOS 15 (Intel) for every push and pull request. These jobs use private pasteboards and temporary installation directories; they do not need a Codex account or control a desktop agent.
+GitHub Actions runs the extension, native state, process, image-size, and installer checks on macOS 14 (Apple silicon) and macOS 15 (Intel), plus popup interaction checks in Chromium on Linux, for every push and pull request. These jobs use private fixtures and temporary installation directories; they do not need a Codex account or control a desktop agent.
 
 ## License
 

@@ -6,6 +6,7 @@ const source = fs.readFileSync(path.join(__dirname, 'background.js'), 'utf8');
 const pause = () => new Promise(resolve => setTimeout(resolve, 90));
 function event() { return { listeners: [], addListener(fn) { this.listeners.push(fn); }, async emit(...args) { await Promise.all(this.listeners.map(fn => fn(...args))); } }; }
 const messages = [];
+const titles = [];
 let settings = { enabled: true };
 let saveSettings = async (value) => { settings = value; };
 let window = { id: 7, focused: true, incognito: false, left: -1280, top: 40, width: 1200, height: 800, state: 'normal', tabs: [{ id: 4, active: true, incognito: false, status: 'complete', url: 'https://example.com/settings' }] };
@@ -14,7 +15,7 @@ let reads = 0;
 const connections = [];
 let connection;
 const chrome = {
-  runtime: { id: 'extension-id', connectNative(name) {
+  runtime: { id: 'extension-id', getURL(file) { return `chrome-extension://extension-id/${file}`; }, connectNative(name) {
     assert.equal(name, 'com.iknowit.bridge');
     connection = { closed: false, messages: [], postMessage(message) {
       if (this.closed) throw new Error('Disconnected port');
@@ -24,12 +25,19 @@ const chrome = {
     return connection;
   }, onInstalled: event(), onStartup: event(), onMessage: event() },
   storage: { local: { async get() { return settings; }, async set(value) { await saveSettings(value); } } },
-  action: { async setBadgeText() {}, async setTitle() {}, onClicked: event() },
+  action: { async setBadgeText() {}, async setTitle({ title }) { titles.push(title); }, onClicked: event() },
   alarms: { async create(_name, options) { assert.equal(options.periodInMinutes, 0.5); }, onAlarm: event() },
   windows: { async getLastFocused() { return structuredClone(window); }, onFocusChanged: event(), onBoundsChanged: event() },
   tabs: { async getZoom() { return 1.25; }, onActivated: event(), onRemoved: event(), onUpdated: event(), onZoomChange: event() },
   scripting: { async executeScript() { reads++; return injected(); } },
 };
+const popupSender = { id: chrome.runtime.id, url: chrome.runtime.getURL('popup.html') };
+function popup(message, sender = popupSender) {
+  return new Promise(resolve => {
+    const keepAlive = chrome.runtime.onMessage.listeners[0](message, sender, resolve);
+    if (keepAlive !== true) resolve(undefined);
+  });
+}
 const sandbox = vm.createContext({ chrome, setTimeout, clearTimeout, console });
 vm.runInContext(source, sandbox);
 (async () => {
@@ -40,12 +48,32 @@ vm.runInContext(source, sandbox);
   assert.equal(messages.at(-1).available, true);
   assert.equal(messages.at(-1).window.left, -1280);
   assert.equal(messages.at(-1).zoom, 1.25);
+  assert.equal(titles.at(-1), 'I Know It! — On');
+  assert.equal(chrome.action.onClicked.listeners.length, 0, 'Toolbar clicks must not toggle the popup state');
+  assert.equal((await popup({ type: 'get-state' })).enabled, true);
+  const controlBaseline = messages.length;
+  assert.equal((await popup({ type: 'set-enabled', enabled: true })).enabled, true);
+  for (const sender of [
+    { ...popupSender, id: 'foreign-extension' }, { ...popupSender, url: 'https://example.com/' },
+    { ...popupSender, url: chrome.runtime.getURL('other.html') },
+    { ...popupSender, url: `${popupSender.url}#spoof` }, { ...popupSender, tab: { id: 4 } },
+    { ...popupSender, tab: null }, {}, null,
+  ]) {
+    assert.equal(await popup({ type: 'get-state' }, sender), undefined);
+    assert.equal(await popup({ type: 'set-enabled', enabled: false }, sender), undefined);
+  }
+  for (const message of [null, {}, { type: 'toggle' }, { type: 'set-enabled' },
+    { type: 'set-enabled', enabled: 'false' }, { type: 'set-enabled', enabled: null },
+    { type: 'set-enabled', enabled: 0 }]) assert.equal(await popup(message), undefined);
+  assert.equal(messages.length, controlBaseline, 'Duplicate state and rejected messages must not affect the host');
+  assert.equal((await popup({ type: 'get-state' })).enabled, true);
   await connection.onMessage.emit({ type: 'request-context', requestId: 'request-1' });
   await pause();
   assert.equal(messages.at(-1).requestId, 'request-1');
   assert.equal(messages.at(-1).url, window.tabs[0].url);
-  await chrome.action.onClicked.emit();
+  await popup({ type: 'set-enabled', enabled: false });
   assert.equal(settings.enabled, false);
+  assert.equal(titles.at(-1), 'I Know It! — Off');
   assert.equal(messages.at(-1).enabled, false);
   const disabledReads = reads;
   await connection.onMessage.emit({ type: 'request-context', requestId: 'off' });
@@ -54,23 +82,32 @@ vm.runInContext(source, sandbox);
   assert.equal(messages.at(-1).requestId, 'off');
   assert.equal(messages.at(-1).url, undefined);
   assert.equal(reads, disabledReads);
-  await chrome.action.onClicked.emit();
+  await popup({ type: 'set-enabled', enabled: true });
   await pause();
   assert.equal(settings.enabled, true);
   assert.equal(messages.at(-1).available, true);
   let pendingWrites = 0;
+  let totalWrites = 0;
+  const beforeRapid = messages.filter(message => message.type === 'enabled').length;
   let maximumWrites = 0;
   saveSettings = async (value) => {
     pendingWrites++;
+    totalWrites++;
     maximumWrites = Math.max(maximumWrites, pendingWrites);
     await new Promise(resolve => setTimeout(resolve, value.enabled ? 5 : 50));
     settings = value;
     pendingWrites--;
   };
-  await Promise.all([chrome.action.onClicked.emit(), chrome.action.onClicked.emit()]);
+  const rapid = await Promise.all([
+    popup({ type: 'set-enabled', enabled: false }), popup({ type: 'set-enabled', enabled: true }),
+    popup({ type: 'set-enabled', enabled: true }), popup({ type: 'get-state' }),
+  ]);
+  assert.deepEqual(rapid.map(reply => reply.enabled), [false, true, true, true]);
   await pause();
-  assert.equal(settings.enabled, true, 'Rapid double-click must persist the final enabled state');
-  assert.equal(maximumWrites, 1, 'Toggle writes must not overlap');
+  assert.equal(settings.enabled, true, 'Rapid explicit state changes must persist the final enabled state');
+  assert.equal(maximumWrites, 1, 'Popup state writes must not overlap');
+  assert.equal(totalWrites, 2, 'A duplicate explicit state must not write storage again');
+  assert.equal(messages.filter(message => message.type === 'enabled').length, beforeRapid + 2);
   assert.equal(messages.filter(message => message.type === 'enabled').at(-1).enabled, true);
   saveSettings = async (value) => { settings = value; };
   const normalInjection = injected;
@@ -79,7 +116,7 @@ vm.runInContext(source, sandbox);
   await connection.onMessage.emit({ type: 'request-context', requestId: 'pending-off' });
   await pause();
   assert.equal(typeof completeRead, 'function');
-  await chrome.action.onClicked.emit();
+  await popup({ type: 'set-enabled', enabled: false });
   const offIndex = messages.length;
   completeRead(await normalInjection());
   await pause();
@@ -88,7 +125,7 @@ vm.runInContext(source, sandbox);
   assert.equal(stoppedRead.url, undefined);
   assert(!messages.slice(offIndex).some(message => message.available === true));
   injected = normalInjection;
-  await chrome.action.onClicked.emit();
+  await popup({ type: 'set-enabled', enabled: true });
   await pause();
 
   injected = () => new Promise(resolve => { completeRead = resolve; });
@@ -221,23 +258,23 @@ vm.runInContext(source, sandbox);
   assert.equal(connection.messages[0].enabled, false);
   assert.equal(reads, beforeForged);
   chrome.storage.local.get = getSettings;
-  await chrome.action.onClicked.emit();
+  await popup({ type: 'set-enabled', enabled: true });
   await pause();
   assert.equal(settings.enabled, true);
-  assert.equal(connection.messages.at(-1).available, true, 'The first click after failed storage initialization must work');
+  assert.equal(connection.messages.at(-1).available, true, 'The first popup change after failed storage initialization must work');
   saveSettings = async () => { throw new Error('Storage write failed'); };
-  await assert.doesNotReject(() => chrome.action.onClicked.emit(), 'Failed persistence must not break the live switch');
+  await assert.doesNotReject(() => popup({ type: 'set-enabled', enabled: false }), 'Failed persistence must not break the live switch');
   assert.equal(connection.messages.at(-1).enabled, false);
   connection.closed = true;
   await connection.onDisconnect.emit();
   const disconnectedCount = connections.length;
-  await assert.doesNotReject(() => chrome.action.onClicked.emit());
+  await assert.doesNotReject(() => popup({ type: 'set-enabled', enabled: true }));
   await pause();
   assert.equal(connections.length, disconnectedCount + 1, 'Failed persistence must not prevent reconnecting the live switch');
   assert.equal(connection.messages[0].enabled, true);
   assert.equal(connection.messages.at(-1).available, true);
   saveSettings = async (value) => { settings = value; };
-  await chrome.action.onClicked.emit();
+  await popup({ type: 'set-enabled', enabled: false });
   assert.equal(settings.enabled, false, 'Persistence must recover on the next successful write');
 
   const handlers = {};
@@ -303,5 +340,5 @@ vm.runInContext(source, sandbox);
   contentChrome.runtime.sendMessage = () => { throw new Error('Extension context invalidated'); };
   page.y++;
   assert.doesNotThrow(() => handlers['window:scroll'](), 'An unloaded extension must not throw errors into the page');
-  console.log('PASS: fresh/correlated context; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; rapid toggles and disabled startup/reconnect; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
+  console.log('PASS: fresh/correlated context; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

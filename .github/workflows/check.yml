@@ -6,6 +6,25 @@ on:
 permissions:
   contents: read
 jobs:
+  popup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Install browser test tools
+        run: |
+          npm install --prefix "$RUNNER_TEMP/iki-popup" --no-save --package-lock=false --ignore-scripts playwright@1.62.1
+          "$RUNNER_TEMP/iki-popup/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Popup interaction and state checks
+        env:
+          NODE_PATH: ${{ runner.temp }}/iki-popup/node_modules
+        run: node check-popup.cjs
   macos:
     strategy:
       fail-fast: false

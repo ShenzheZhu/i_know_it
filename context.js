@@ -1,4 +1,6 @@
 (() => {
+  if (globalThis.__iKnowItContextReady) return;
+  globalThis.__iKnowItContextReady = true;
   let enabled = false;
   let stateRevision = 0;
   let previous;
@@ -38,8 +40,12 @@
     previous = undefined;
     report();
   }
-  chrome.runtime.onMessage.addListener((message, sender) => {
-    if (message?.type === 'page-state' && sender.id === chrome.runtime.id && !sender.tab) setEnabled(message.enabled);
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === 'page-state' && typeof message.enabled === 'boolean'
+      && sender?.id === chrome.runtime.id && sender.tab === undefined) {
+      setEnabled(message.enabled);
+      sendResponse?.({ contextReady: true });
+    }
   });
   function readState() {
     setEnabled(false);

@@ -8,9 +8,16 @@ function event() { return { listeners: [], addListener(fn) { this.listeners.push
 const messages = [];
 const broadcasts = [];
 const pageUpdates = [];
+const pageInjections = [];
+const initializedPages = new Set([4]);
+let pageReply = async tabId => {
+  if (!initializedPages.has(tabId)) throw new Error('Tab has no current content script');
+  return { contextReady: true };
+};
+let installPage = async tabId => { initializedPages.add(tabId); };
 const openPages = [
   { id: 4, url: 'https://example.com/settings', incognito: false },
-  { id: 6, url: 'http://example.com/background', incognito: false },
+  { id: 6, url: 'http://example.com/background', incognito: false, status: 'loading' },
   { id: 8, url: 'https://private.example/', incognito: true },
   { id: 9, url: 'chrome://settings/' }, { id: 10, url: 'file:///private/page.html' },
 ];
@@ -37,12 +44,22 @@ const chrome = {
   alarms: { async create(_name, options) { assert.equal(options.periodInMinutes, 0.5); }, onAlarm: event() },
   windows: { WINDOW_ID_NONE: -1, async getLastFocused() { return structuredClone(window); }, onFocusChanged: event(), onBoundsChanged: event() },
   tabs: { async query(options) { assert.deepEqual(Object.keys(options), []); return structuredClone(openPages); },
+    async get(tabId) { const tab = openPages.find(tab => tab.id === tabId); if (!tab) throw new Error('Closed tab'); return structuredClone(tab); },
     async sendMessage(tabId, message, options) {
       assert.equal(options.frameId, 0);
       pageUpdates.push({ tabId, ...message });
-      if (tabId === 6) throw new Error('Tab has no content script');
+      return pageReply(tabId);
     }, async getZoom() { return 1.25; }, onActivated: event(), onRemoved: event(), onUpdated: event(), onZoomChange: event() },
-  scripting: { async executeScript() { reads++; return injected(); } },
+  scripting: { async executeScript(options) {
+    if (options.files) {
+      assert.deepEqual(JSON.parse(JSON.stringify(options)), { target: { tabId: options.target.tabId, frameIds: [0] }, files: ['context.js'], injectImmediately: true },
+        'A loading existing page must not hold startup until document_idle');
+      pageInjections.push(options.target.tabId);
+      await installPage(options.target.tabId);
+      return [{ frameId: 0 }];
+    }
+    reads++; return injected();
+  } },
 };
 const popupSender = { id: chrome.runtime.id, url: chrome.runtime.getURL('popup.html') };
 const pageSender = { id: chrome.runtime.id, frameId: 0, tab: { id: 4, active: true, incognito: false }, url: 'https://example.com/settings' };
@@ -57,8 +74,40 @@ vm.runInContext(source, sandbox);
 (async () => {
   await vm.runInContext('ready', sandbox);
   await pause();
-  assert.deepEqual(pageUpdates, [4, 6].map(tabId => ({ tabId, type: 'page-state', enabled: true })),
-    'Startup must update only HTTP(S), non-private top-level pages, tolerating a missing content script');
+  assert.deepEqual(pageUpdates, [4, 6, 6].map(tabId => ({ tabId, type: 'page-state', enabled: true })),
+    'Startup initializes a missing collector and synchronizes only eligible top-level pages');
+  assert.deepEqual(pageInjections, [6], 'Initialize the missing collector immediately even while its document is loading; do not reinject the healthy receiver');
+  await vm.runInContext('updatePages()', sandbox);
+  await vm.runInContext('updatePages()', sandbox);
+  assert.deepEqual(pageInjections, [6], 'Repeated synchronization must reuse acknowledged collectors');
+  const healthyReply = pageReply;
+  initializedPages.delete(6);
+  pageReply = tabId => tabId === 6 && !initializedPages.has(tabId) ? undefined : healthyReply(tabId);
+  await vm.runInContext('updatePages()', sandbox);
+  pageReply = healthyReply;
+  assert.deepEqual(pageInjections, [6, 6], 'A fulfilled message without the explicit ACK still needs initialization');
+  const getTab = chrome.tabs.get;
+  for (const changed of [{ incognito: true }, { url: 'chrome://settings/' }, { url: 'file:///private/page.html' }, null]) {
+    initializedPages.delete(6);
+    const before = pageInjections.length;
+    chrome.tabs.get = async tabId => {
+      if (tabId !== 6) return getTab(tabId);
+      if (!changed) throw new Error('Tab closed during initialization');
+      return { ...(await getTab(tabId)), ...changed };
+    };
+    await vm.runInContext('updatePages()', sandbox);
+    assert.equal(pageInjections.length, before, 'Recheck current URL/privacy before injecting a previously eligible tab');
+  }
+  chrome.tabs.get = getTab;
+  const completeInstallation = installPage;
+  installPage = async () => { throw new Error('Injection was denied'); };
+  const beforeFailure = pageUpdates.length;
+  await assert.doesNotReject(() => vm.runInContext('updatePages()', sandbox));
+  assert.deepEqual(pageUpdates.slice(beforeFailure).map(update => update.tabId), [4, 6], 'A failed injection must not pretend to initialize or repeatedly message the missing collector');
+  assert(!initializedPages.has(6));
+  installPage = completeInstallation;
+  await vm.runInContext('updatePages()', sandbox);
+  assert(initializedPages.has(6), 'A later startup/toggle synchronization can recover a previously denied injection');
   assert.equal((await popup({ type: 'get-page-state' }, pageSender)).enabled, true);
   assert.equal((await popup({ type: 'get-page-state' }, { ...pageSender, tab: { ...pageSender.tab, active: false } })).enabled, true,
     'An inactive page needs the authoritative live switch state too');
@@ -166,6 +215,30 @@ vm.runInContext(source, sandbox);
   assert.equal(messages.filter(message => message.type === 'enabled').at(-1).enabled, true);
   assert(pageUpdates.slice(-2).every(update => update.enabled === true), 'Serialized toggles must leave all pages in their final state');
   saveSettings = async (value) => { settings = value; };
+  initializedPages.delete(6);
+  let finishOlderInjection, injectionStarted;
+  const startedInjection = new Promise(resolve => { injectionStarted = resolve; });
+  let delayedOnce = false;
+  installPage = async tabId => {
+    if (!delayedOnce) {
+      delayedOnce = true;
+      injectionStarted();
+      await new Promise(resolve => { finishOlderInjection = resolve; });
+    }
+    await completeInstallation(tabId);
+  };
+  const olderPageSync = vm.runInContext('updatePages()', sandbox);
+  await startedInjection;
+  await popup({ type: 'set-enabled', enabled: false });
+  const afterOffSync = pageUpdates.length;
+  finishOlderInjection();
+  await olderPageSync;
+  assert.deepEqual(pageUpdates.slice(afterOffSync), [{ tabId: 6, type: 'page-state', enabled: false }],
+    'An older initialization completing after OFF must deliver current OFF, never its original ON state');
+  assert.equal((await popup({ type: 'get-page-state' }, pageSender)).enabled, false);
+  installPage = completeInstallation;
+  await popup({ type: 'set-enabled', enabled: true });
+  await pause();
   const normalInjection = injected;
   let completeRead;
   injected = () => new Promise(resolve => { completeRead = resolve; });
@@ -386,6 +459,10 @@ vm.runInContext(source, sandbox);
     visualViewport: { scale: 1.125, offsetLeft: -2.75, offsetTop: 13.5 },
   });
   injected = async () => [{ frameId: 0, result: vm.runInContext('pageContext()', sandbox) }];
+  initializedPages.delete(4);
+  installPage = async () => { throw new Error('Existing page cannot be initialized'); };
+  await vm.runInContext('updatePages()', sandbox);
+  assert(!initializedPages.has(4));
   await connection.onMessage.emit({ type: 'request-context', requestId: 'fractional' });
   await pause();
   const fractional = messages.find(message => message.requestId === 'fractional');
@@ -397,6 +474,10 @@ vm.runInContext(source, sandbox);
   assert.equal(fractional.visualViewport.scale, 1.125);
   assert.equal(fractional.visualViewport.offsetLeft, -2.75);
   assert.equal(fractional.visualViewport.offsetTop, 13.5);
+  assert.equal(fractional.pointerAnchor, undefined, 'Failed collector initialization must retain ordinary page observations without inventing calibration');
+  assert.equal(fractional.pageWindow, undefined);
+  installPage = completeInstallation;
+  await vm.runInContext('updatePages()', sandbox);
   chrome.tabs.getZoom = getZoom;
   injected = normalInjection;
 
@@ -621,7 +702,15 @@ vm.runInContext(source, sandbox);
   assert.equal(stateRequests.length, 1);
   assert.deepEqual(Object.keys(stateRequests[0]), ['type']);
   assert.equal(contentMessages.length, 0, 'Content must start OFF until it receives the live state');
-  await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: true }, { id: chrome.runtime.id });
+  const installedHandlers = { ...handlers }, installedInterval = interval;
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'context.js'), 'utf8'), content);
+  assert.deepEqual(handlers, installedHandlers);
+  assert.equal(interval, installedInterval);
+  assert.equal(contentChrome.runtime.onMessage.listeners.length, 1);
+  assert.equal(stateRequests.length, 1, 'Concurrent/repeated file injection must not install duplicate collectors or request state twice');
+  let pageAcknowledgement;
+  await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: true }, { id: chrome.runtime.id }, reply => { pageAcknowledgement = reply; });
+  assert.equal(pageAcknowledgement.contextReady, true, 'A current collector explicitly acknowledges trusted page-state synchronization');
   resolveInitialState({ enabled: false });
   await Promise.resolve();
   assert.equal(contentMessages.length, 1, 'A delayed initial state must not override a newer live toggle');
@@ -669,6 +758,11 @@ vm.runInContext(source, sandbox);
   assert.deepEqual(JSON.parse(JSON.stringify(anchor.client)), { x: 100.25, y: 20.5 });
   assert.equal(anchor.ageMs, 0);
   assert(Number.isFinite(Date.parse(anchor.observedAt)));
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'context.js'), 'utf8'), content);
+  assert.equal(contentChrome.runtime.onMessage.listeners.length, 1);
+  assert.deepEqual(handlers, installedHandlers);
+  assert.equal(interval, installedInterval);
+  assert.equal(JSON.stringify(readPage().pointerAnchor), JSON.stringify(anchor), 'A redundant injection must not reset an existing calibration');
   for (const ageMs of [1000, 1000.25, 60_000, 600_000]) {
     now = 1000 + ageMs; interval();
     const stationary = readPage().pointerAnchor;
@@ -765,11 +859,13 @@ vm.runInContext(source, sandbox);
   page.visibility = 'visible'; handlers['document:visibilitychange']();
   assert.equal(readPage().pointerAnchor, undefined, 'Hiding and reopening a page must not revive an anchor');
 
-  for (const sender of [{ id: 'foreign-extension' }, { id: chrome.runtime.id, tab: { id: 4 } }]) {
+  for (const sender of [null, {}, { id: 'foreign-extension' }, { id: chrome.runtime.id, tab: { id: 4 } }, { id: chrome.runtime.id, tab: null }]) {
     move();
-    await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: false }, sender);
+    await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: false }, sender, () => assert.fail('Untrusted state messages must not receive an ACK'));
     assert(readPage().pointerAnchor, 'Page and foreign senders cannot change the live switch');
   }
+  await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: 'false' }, { id: chrome.runtime.id }, () => assert.fail('Malformed state must not receive an ACK'));
+  assert(readPage().pointerAnchor, 'Only a Boolean state may change collection');
   await contentChrome.runtime.onMessage.emit({ type: 'page-state', enabled: false }, { id: chrome.runtime.id });
   const offSignals = contentMessages.length;
   page.y++; interval(); move();
@@ -851,11 +947,13 @@ vm.runInContext(source, sandbox);
         return Promise.resolve(initialState === 'unavailable' ? undefined : { enabled: initialState });
       },
     } } };
+    delete startupContent.__iKnowItContextReady;
+    delete startupContent.__iKnowItPageContext;
     assert.doesNotThrow(() => vm.runInContext(fs.readFileSync(path.join(__dirname, 'context.js'), 'utf8'), vm.createContext(startupContent)));
     await Promise.resolve();
     await Promise.resolve();
     assert.equal(startupSignals.length, initialState === true ? 1 : 0,
       'Only an authoritative initial ON reply may enable page reporting');
   }
-  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; authoritative page state and failed-storage toggle propagation; trusted/fractional calibration preserved while stationary with original timestamps; ineligible-event seed rejection without replacing valid calibration; invalid-age, hidden, pointer-lock, OFF and geometry clearing without resurrection; equal-size structural signals invalidate pending native estimates; metadata-only signals without DOM writes; geometry invalidation on different Chrome windows without same-window focus cancellation; authoritative BFCache/resume state, freeze clearing and stale-reply isolation; forged/iframe messages rejected.');
+  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; authoritative page state and failed-storage toggle propagation; immediate existing-page recovery only after missing ACK, current URL/privacy guards, injection-failure fallback, OFF-during-injection isolation and duplicate-collector prevention; trusted/fractional calibration preserved while stationary with original timestamps; ineligible-event seed rejection without replacing valid calibration; invalid-age, hidden, pointer-lock, OFF and geometry clearing without resurrection; equal-size structural signals invalidate pending native estimates; metadata-only signals without DOM writes; geometry invalidation on different Chrome windows without same-window focus cancellation; authoritative BFCache/resume state, freeze clearing and stale-reply isolation; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

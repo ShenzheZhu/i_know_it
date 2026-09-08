@@ -54,7 +54,16 @@ async function updatePages() {
   try {
     const tabs = await chrome.tabs.query({});
     await Promise.all(tabs.filter(tab => !tab.incognito && /^https?:\/\//.test(tab.url ?? ''))
-      .map(tab => chrome.tabs.sendMessage(tab.id, { type: 'page-state', enabled }, { frameId: 0 }).catch(() => {})));
+      .map(async tab => {
+        const update = () => chrome.tabs.sendMessage(tab.id, { type: 'page-state', enabled }, { frameId: 0 });
+        try { if ((await update())?.contextReady === true) return; } catch { /* The page may predate this extension load. */ }
+        try {
+          const current = await chrome.tabs.get(tab.id);
+          if (current.incognito || !/^https?:\/\//.test(current.url ?? '')) return;
+          await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, files: ['context.js'], injectImmediately: true });
+          await update();
+        } catch { /* Restricted or closed pages retain the ordinary observation fallback. */ }
+      }));
   } catch { /* Closing tabs or pages without our content script need no update. */ }
 }
 

@@ -92,7 +92,7 @@ const server = http.createServer((_request, response) => {
     const browserSession = await browser.newBrowserCDPSession();
     const installed = await browserSession.send('Extensions.loadUnpacked', { path: extension, enableInIncognito: false });
     const workerURL = `chrome-extension://${installed.id}/`;
-    let worker = context.serviceWorkers().find(worker => worker.url().startsWith(workerURL))
+    const worker = context.serviceWorkers().find(worker => worker.url().startsWith(workerURL))
       || await context.waitForEvent('serviceworker', { predicate: worker => worker.url().startsWith(workerURL) });
     await worker.evaluate(async () => { await __contextTest.ready; });
     const tabId = await worker.evaluate(async url => (await chrome.tabs.query({})).find(tab => tab.url === url)?.id, page.url());
@@ -286,16 +286,35 @@ const server = http.createServer((_request, response) => {
         globalThis.__contextBeforeReload = true;
       } });
     }, tabId);
-    const oldWorker = worker;
-    [worker] = await Promise.all([
-      context.waitForEvent('serviceworker', { timeout: 10_000,
-        predicate: candidate => candidate !== oldWorker && candidate.url().startsWith(workerURL) }),
-      oldWorker.evaluate(() => { setTimeout(() => chrome.runtime.reload(), 100); }),
-    ]);
+    const workerBeforeReload = await worker.evaluate(() => performance.timeOrigin);
+    await worker.evaluate(() => { setTimeout(() => chrome.runtime.reload(), 100); });
+    // Playwright keeps the same Worker across MV3 restarts; wait for a fresh context.
+    // https://github.com/microsoft/playwright/pull/39476
+    const reloadDeadline = Date.now() + 10_000;
     let readyTimeout;
     try {
       await Promise.race([
-        worker.evaluate(async () => { await __contextTest.ready; }),
+        (async () => {
+          while (Date.now() < reloadDeadline) {
+            let restartedAt;
+            try {
+              restartedAt = await worker.evaluate(async before => {
+                if (performance.timeOrigin === before) return before;
+                await __contextTest.ready;
+                return performance.timeOrigin;
+              }, workerBeforeReload);
+            } catch (error) {
+              if (!/Service worker restarted|Execution context was destroyed/.test(error.message)) throw error;
+            }
+            if (restartedAt !== undefined && restartedAt !== workerBeforeReload) {
+              assert(Number.isFinite(restartedAt) && restartedAt > workerBeforeReload,
+                'runtime.reload must start a newer worker execution context');
+              return;
+            }
+            await delay(100);
+          }
+          assert.fail('runtime.reload did not replace the worker execution context within 10 seconds');
+        })(),
         new Promise((_, reject) => { readyTimeout = setTimeout(() => reject(new Error('Reloaded extension did not become ready within 10 seconds')), 10_000); }),
       ]);
     } finally { clearTimeout(readyTimeout); }

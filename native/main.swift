@@ -485,14 +485,13 @@ struct SuspendedCapture {
     let suspendedAt: TimeInterval
     let image: ClipboardImage
     let region: RegionObservation
-    var context: GestureContext
+    let context: GestureContext
     let observedAt: Date
     let observedApp: String?
     let browser: [String: Any]?
     let files: [URL]?
     let owned: Int?
     let ownershipToken: String?
-    var metadataNeedsRewrite = false
 }
 
 final class Bridge {
@@ -600,8 +599,6 @@ final class Bridge {
         observedAt = saved.observedAt; observedApp = saved.observedApp; browser = saved.browser; files = saved.files
         seen = generation; owned = saved.owned; ownershipToken = saved.ownershipToken
         captureEpoch = saved.epoch; captureItems = saved.items
-        // Correct a resurfacing pair before accepting ownership; failed writes withdraw it.
-        if saved.metadataNeedsRewrite { updatePreparedMarkdown() }
         return true
     }
     func ownsClipboard() -> Bool {
@@ -613,18 +610,9 @@ final class Bridge {
     func receive(_ message: [String: Any]) {
         if message["type"] as? String == "enabled", let value = message["enabled"] as? Bool { setEnabled(value); return }
         if enabled, message["type"] as? String == "browser-geometry-invalidated" {
+            // The snapshot freezes when a matching clipboard image is accepted, not at mouse-up.
+            // Later page changes cannot alter an already completed or suspended screenshot.
             gestureContext?.geometryInvalidated = true
-            if var saved = suspended, !saved.context.geometryInvalidated {
-                saved.context.geometryInvalidated = true
-                if let md = saved.files?.last {
-                    do { try writeMarkdown(saved.image, to: md, snapshot: saved) }
-                    catch { saved.metadataNeedsRewrite = true }
-                }
-                suspended = saved
-            }
-            let changed = regionContext?.geometryInvalidated == false
-            regionContext?.geometryInvalidated = true
-            if changed { updatePreparedMarkdown() }
             return
         }
         guard enabled, message["type"] as? String == "browser-context",
@@ -646,13 +634,7 @@ final class Bridge {
         requestID = nil
         tick()
     }
-    func markdown(_ image: ClipboardImage, snapshot: SuspendedCapture? = nil) -> String {
-        let observedAt = snapshot?.observedAt ?? self.observedAt
-        let observedApp = snapshot == nil ? self.observedApp : snapshot!.observedApp
-        let browser = snapshot == nil ? self.browser : snapshot!.browser
-        let region = snapshot?.region ?? self.region
-        let regionContext = snapshot?.context ?? self.regionContext
-        let regionDiagnostic = snapshot == nil ? self.regionDiagnostic : nil
+    func markdown(_ image: ClipboardImage) -> String {
         var lines = [
             "# Screenshot context", "",
             "- Image: screenshot.png (original image; no crop, scaling, or annotation).",
@@ -715,8 +697,8 @@ final class Bridge {
         } else { lines.append("- Browser context: unavailable; no page attribution is inferred.") }
         return lines.joined(separator: "\n") + "\n"
     }
-    func writeMarkdown(_ image: ClipboardImage, to url: URL, snapshot: SuspendedCapture? = nil) throws {
-        try Data(markdown(image, snapshot: snapshot).utf8).write(to: url, options: .atomic)
+    func writeMarkdown(_ image: ClipboardImage, to url: URL) throws {
+        try Data(markdown(image).utf8).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
     func updatePreparedMarkdown() {
@@ -1564,7 +1546,8 @@ func selfTest() throws {
     func startSelection(replyBeforeEnd: Bool = false,
                         start: CGPoint = CGPoint(x: -80, y: -20),
                         end: CGPoint = CGPoint(x: -76, y: -17),
-                        beforeMouseDown: ((String) -> Void)? = nil) -> String {
+                        beforeMouseDown: ((String) -> Void)? = nil,
+                        beforeMouseUp: (() -> Void)? = nil) -> String {
         bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
         now += 10
         bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
@@ -1575,6 +1558,7 @@ func selfTest() throws {
         bridge.observeGesture(type: .flagsChanged, flags: [])
         bridge.observeGesture(type: .leftMouseDown, flags: [], location: start)
         bridge.observeGesture(type: .leftMouseDragged, flags: [], location: CGPoint(x: -78.25, y: -18.75))
+        beforeMouseUp?()
         now += 0.2
         bridge.observeGesture(type: .leftMouseUp, flags: [], location: end)
         return id
@@ -1655,40 +1639,53 @@ func selfTest() throws {
     bridge.setEnabled(false)
 
     let invalidate: [String: Any] = ["type": "browser-geometry-invalidated"]
-    for stage in ["before-reply", "after-reply", "after-mouse-up", "after-file-write"] {
+    for stage in ["before-reply", "after-reply", "during-drag", "after-mouse-up", "after-match-before-file", "after-file-write"] {
+        let invalidBeforeCapture = ["before-reply", "after-reply", "during-drag", "after-mouse-up"].contains(stage)
         _ = startSelection(beforeMouseDown: { id in
             if stage == "before-reply" { bridge.receive(invalidate) }
             var reply = pageReply(id)
             reply["geometryInvalidated"] = false // Reply data cannot erase an independent invalidation.
             bridge.receive(reply)
             if stage == "after-reply" { bridge.receive(invalidate) }
+        }, beforeMouseUp: {
+            if stage == "during-drag" { bridge.receive(invalidate) }
         })
         if stage == "after-mouse-up" { bridge.receive(invalidate) }
-        putImage(); app = "com.openai.codex"; bridge.tick()
-        let paths = bridge.files!, before = board.changeCount
-        if stage == "after-file-write" {
-            let estimatedMD = try String(contentsOf: paths[1], encoding: .utf8)
-            assert(estimatedMD.contains("Estimated selection in viewport CSS pixels: x=10.0, y=5.0, width=4.0, height=3.0"))
-            assert(estimatedMD.contains("Estimated selection in top-document CSS pixels: x=21.0, y=105.0, width=4.0, height=3.0"))
-            assert(estimatedMD.contains("recent pointer") && estimatedMD.contains("up to 1 display point"))
+        putImage(); bridge.tick()
+        if stage == "after-match-before-file" {
+            let snapshot = bridge.markdown(bridge.original!)
+            assert(bridge.files == nil && bridge.regionContext?.geometryInvalidated == false)
             bridge.receive(invalidate)
+            assert(bridge.markdown(bridge.original!) == snapshot, "A completed pending capture is already frozen")
         }
-        let invalidatedMD = try String(contentsOf: paths[1], encoding: .utf8)
-        assert(!invalidatedMD.contains("Estimated selection") && invalidatedMD.contains("browser geometry changed"), stage)
-        assert(bridge.region != nil && bridge.regionContext?.geometryInvalidated == true)
-        assert(bridge.regionContext?.browser?["pointerAnchor"] != nil && bridge.browser?["url"] as? String == "https://example.com/source-a")
-        assert(invalidatedMD.contains("Observed raw drag extent") && invalidatedMD.contains("source-a"))
-        let preservedImage = try Data(contentsOf: paths[0])
-        assert(preservedImage == png && board.changeCount == before, "Invalidation only rewrites metadata")
+        app = "com.openai.codex"; bridge.tick()
+        let paths = bridge.files!, before = board.changeCount, beforeMD = try Data(contentsOf: bridge.files![1])
+        if stage == "after-file-write" { bridge.receive(invalidate) }
+        let afterMD = try Data(contentsOf: paths[1]), md = String(decoding: afterMD, as: UTF8.self)
+        assert(afterMD == beforeMD && board.changeCount == before, "Post-capture geometry must not rewrite files or clipboard")
+        assert(bridge.region != nil && bridge.regionContext?.geometryInvalidated == invalidBeforeCapture)
+        if invalidBeforeCapture { assert(!md.contains("Estimated selection") && md.contains("browser geometry changed"), stage) }
+        else {
+            assert(md.contains("Estimated selection in viewport CSS pixels: x=10.0, y=5.0, width=4.0, height=3.0"), stage)
+            assert(md.contains("Estimated selection in top-document CSS pixels: x=21.0, y=105.0, width=4.0, height=3.0"), stage)
+        }
+        assert(bridge.regionContext?.browser?["pointerAnchor"] != nil && md.contains("Observed raw drag extent") && md.contains("source-a"))
+        let preservedImage = try Data(contentsOf: paths[0]); assert(preservedImage == png)
         bridge.receive(invalidate)
-        assert(board.changeCount == before, "Duplicate invalidation does not write clipboard")
+        let repeatedMD = try Data(contentsOf: paths[1])
+        assert(repeatedMD == beforeMD, "Repeated later changes cannot mutate the captured snapshot")
     }
     // A new gesture has its own invalidation flag, even without toggling the product.
+    let completedPath = bridge.files![1], completedMD = try Data(contentsOf: bridge.files![1])
     app = "com.google.Chrome"; bridge.tick(); now += 10
     bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
     assert(bridge.gesture.isArmed && bridge.gestureContext?.geometryInvalidated == false)
     bridge.receive(pageReply(requested))
     assert(bridge.gestureContext?.browser?["pointerAnchor"] != nil && bridge.gestureContext?.geometryInvalidated == false)
+    bridge.receive(invalidate)
+    assert(bridge.gestureContext?.geometryInvalidated == true && bridge.regionContext?.geometryInvalidated == false)
+    let previousCaptureMD = try Data(contentsOf: completedPath)
+    assert(previousCaptureMD == completedMD, "A new pending gesture cannot invalidate the previous completed capture")
     bridge.cancelGesture()
     _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) })
     putImage(); app = "com.openai.codex"; bridge.tick()
@@ -1710,28 +1707,6 @@ func selfTest() throws {
         try FileManager.default.moveItem(at: paths[1], to: paths[1].appendingPathExtension("saved"))
         try FileManager.default.createDirectory(at: paths[1], withIntermediateDirectories: false)
         return paths
-    }
-    for ownershipLost in [false, true] {
-        _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) })
-        putImage(); app = "com.openai.codex"; bridge.tick()
-        let stalePaths = try blockPreparedRewrite()
-        if ownershipLost { board.clearContents(); board.setString("newer user copy", forType: .string) }
-        let beforeFailure = board.changeCount
-        bridge.receive(invalidate)
-        assert(bridge.files == nil && !bridge.ownsClipboard(), "Failed correction must withdraw the stale prepared pair")
-        if ownershipLost {
-            assert(board.changeCount == beforeFailure && board.string(forType: .string) == "newer user copy",
-                   "Failed correction must preserve a newer clipboard owner")
-        } else {
-            assert(board.data(forType: .png) == png && board.pasteboardItems?.count == 1,
-                   "Failed correction restores our original image instead of offering stale CSS metadata")
-            bridge.tick()
-            assert(bridge.ownsClipboard() && bridge.files != stalePaths, "Next tick prepares a fresh pair")
-            let correctedMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
-            assert(!correctedMD.contains("Estimated selection") && correctedMD.contains("browser geometry changed"))
-        }
-        assert(FileManager.default.fileExists(atPath: stalePaths[1].appendingPathExtension("saved").path),
-               "Historical files must remain on disk")
     }
     bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true); putImage(); bridge.tick()
     let lateRewriteID = requested
@@ -1762,7 +1737,7 @@ func selfTest() throws {
     }
     let rollbackCases = ["raw", "owned", "owned-away", "empty-overlay", "deferred-overlay", "newer-equal",
         "changed-bytes", "changed-types", "epoch", "epoch-race", "count-race", "epoch-unavailable", "off", "expired",
-        "invalidate", "invalidate-owned", "invalidate-failure", "mutable-file", "returned-delayed", "returned-delayed-empty", "returned-delayed-timeout"]
+        "invalidate", "invalidate-owned", "mutable-file", "returned-delayed", "returned-delayed-empty", "returned-delayed-timeout"]
     for test in rollbackCases {
         displayedCount = nil; epoch = stableEpoch; bridge.pasteboardEpoch = { epoch }
         _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) })
@@ -1775,7 +1750,8 @@ func selfTest() throws {
         bridge.tick(); app = "com.openai.codex"; bridge.tick()
         assert(bridge.region != nil && bridge.captureItems != nil)
         let originalFiles = bridge.files!, originalDate = bridge.observedAt, captureID = bridge.regionContext!.id
-        let keepOwned = ["owned", "owned-away", "invalidate-owned", "invalidate-failure"].contains(test)
+        let originalMD = try Data(contentsOf: originalFiles[1])
+        let keepOwned = ["owned", "owned-away", "invalidate-owned"].contains(test)
         if !keepOwned { app = "com.google.Chrome"; bridge.tick() }
         let generation = bridge.seen, oldItems = completePasteboardItems(board)!
         if test == "empty-overlay" || test == "returned-delayed-empty" { board.clearContents() }
@@ -1785,13 +1761,10 @@ func selfTest() throws {
         if test == "mutable-file" { assert(bridge.suspended == nil); continue }
         assert(bridge.suspended?.generation == generation && bridge.original == nil, test)
         if test.hasPrefix("invalidate") {
-            if test == "invalidate-failure" {
-                try FileManager.default.moveItem(at: originalFiles[1], to: originalFiles[1].appendingPathExtension("saved"))
-                try FileManager.default.createDirectory(at: originalFiles[1], withIntermediateDirectories: false)
-            }
             bridge.receive(invalidate)
-            assert(bridge.suspended?.context.geometryInvalidated == true)
-            if test == "invalidate-failure" { assert(bridge.suspended?.metadataNeedsRewrite == true) }
+            assert(bridge.suspended?.context.geometryInvalidated == false)
+            let suspendedMD = try Data(contentsOf: originalFiles[1])
+            assert(suspendedMD == originalMD, "Suspended raw/pair snapshots stay byte-for-byte stable")
         }
         if test == "off" { bridge.setEnabled(false); assert(bridge.suspended == nil) }
         if test == "expired" { now += 601 }
@@ -1827,10 +1800,8 @@ func selfTest() throws {
             assert(bridge.regionContext?.id == captureID && bridge.observedAt == originalDate, test)
             assert(bridge.region?.globalRect == CGRect(x: -80, y: -20, width: 4, height: 3), test)
             let recoveredMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
-            if test.hasPrefix("invalidate") { assert(!recoveredMD.contains("Estimated selection") && recoveredMD.contains("browser geometry changed"), test) }
-            else { assert(recoveredMD.contains("Estimated selection in viewport CSS pixels"), test) }
-            if test == "invalidate-failure" { assert(bridge.files != originalFiles && bridge.ownsClipboard()) }
-            else { assert(bridge.files == originalFiles, test) }
+            assert(recoveredMD.contains("Estimated selection in viewport CSS pixels"), test)
+            assert(bridge.files == originalFiles && Data(recoveredMD.utf8) == originalMD, test)
             if test == "owned-away" { assert(bridge.owned == nil && board.data(forType: .png) == png) }
         }
     }
@@ -1899,7 +1870,7 @@ func selfTest() throws {
     assert(bridge.suspended == nil && bridge.regionContext?.id != earlierCaptureID && bridge.region != nil)
     bridge.setEnabled(false)
     bridge.pasteboardEpoch = currentPasteboardEpoch
-    print("PASS: 21 private-board rollback cases, exact generation/representations/epoch, cached invalidation, ownership, and bounded deferred image data.")
+    print("PASS: 20 private-board rollback cases, exact generation/representations/epoch, frozen capture snapshots, ownership, and bounded deferred image data.")
 
     var permissionRequests = 0, inputStates: [String] = []
     let monitor = RegionInputMonitor(bridge: bridge, preflight: { false },

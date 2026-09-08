@@ -21,14 +21,14 @@ const chrome = {
     connection = { closed: false, messages: [], postMessage(message) {
       if (this.closed) throw new Error('Disconnected port');
       this.messages.push(message); messages.push(message);
-    }, onMessage: event(), onDisconnect: event() };
+    }, disconnect() { this.closed = true; void this.onDisconnect.emit(); }, onMessage: event(), onDisconnect: event() };
     connections.push(connection);
     return connection;
   }, onInstalled: event(), onStartup: event(), onMessage: event() },
   storage: { local: { async get() { return settings; }, async set(value) { await saveSettings(value); } } },
   action: { async setBadgeText() {}, async setTitle({ title }) { titles.push(title); }, onClicked: event() },
   alarms: { async create(_name, options) { assert.equal(options.periodInMinutes, 0.5); }, onAlarm: event() },
-  windows: { async getLastFocused() { return structuredClone(window); }, onFocusChanged: event(), onBoundsChanged: event() },
+  windows: { WINDOW_ID_NONE: -1, async getLastFocused() { return structuredClone(window); }, onFocusChanged: event(), onBoundsChanged: event() },
   tabs: { async getZoom() { return 1.25; }, onActivated: event(), onRemoved: event(), onUpdated: event(), onZoomChange: event() },
   scripting: { async executeScript() { reads++; return injected(); } },
 };
@@ -373,6 +373,84 @@ vm.runInContext(source, sandbox);
   assert.equal(fractional.visualViewport.offsetTop, 13.5);
   chrome.tabs.getZoom = getZoom;
   injected = normalInjection;
+
+  const permissionPause = () => new Promise(resolve => setTimeout(resolve, 180));
+  async function returnToChrome() {
+    await chrome.windows.onFocusChanged.emit(chrome.windows.WINDOW_ID_NONE);
+    await chrome.windows.onFocusChanged.emit(window.id);
+    await permissionPause();
+  }
+  let permissionConnections = connections.length;
+  await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
+  await chrome.runtime.onStartup.emit();
+  await popup({ type: 'set-enabled', enabled: true });
+  await popup({ type: 'get-state' });
+  await popup({ type: 'request-input-access' }, { ...popupSender, tab: { id: 4 } });
+  await returnToChrome();
+  assert.equal(connections.length, permissionConnections, 'Startup, ON, polling and forged requests must not arm a permission restart');
+
+  connection.closed = true;
+  await popup({ type: 'request-input-access' });
+  connection.closed = false;
+  await returnToChrome();
+  assert.equal(connections.length, permissionConnections, 'A failed permission message must not arm a restart');
+
+  await popup({ type: 'request-input-access' });
+  await chrome.windows.onFocusChanged.emit(window.id);
+  await chrome.tabs.onActivated.emit();
+  await chrome.windows.onBoundsChanged.emit();
+  await popup({ type: 'get-state' });
+  await permissionPause();
+  assert.equal(connections.length, permissionConnections, 'Permission requests must wait for Chrome to lose focus before restarting');
+  const deniedConnection = connection;
+  await chrome.windows.onFocusChanged.emit(chrome.windows.WINDOW_ID_NONE);
+  await chrome.windows.onFocusChanged.emit(window.id);
+  assert.equal(deniedConnection.closed, true, 'Returning from permission settings must close the cached-denial host');
+  await chrome.alarms.onAlarm.emit({ name: 'native-reconnect' });
+  await popup({ type: 'set-enabled', enabled: true });
+  assert.equal(connections.length, permissionConnections, 'Alarms and duplicate ON must respect the host shutdown delay');
+  await permissionPause();
+  assert.equal(connections.length, ++permissionConnections, 'Returning from permission settings must reconnect exactly once');
+  assert.equal(connection.messages[0].enabled, true);
+  await returnToChrome();
+  assert.equal(connections.length, permissionConnections, 'Later ordinary focus changes must not restart the host');
+
+  await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
+  await popup({ type: 'request-input-access' });
+  await deniedConnection.onMessage.emit({ type: 'input-status', status: 'ready' });
+  await deniedConnection.onDisconnect.emit();
+  assert.equal((await popup({ type: 'get-state' })).inputStatus, 'permission-required', 'Old ports must not alter the current permission state');
+  await returnToChrome();
+  assert.equal(connections.length, ++permissionConnections, 'Old-port callbacks must not cancel a new permission return');
+
+  await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
+  await popup({ type: 'request-input-access' });
+  await chrome.windows.onFocusChanged.emit(chrome.windows.WINDOW_ID_NONE);
+  await popup({ type: 'set-enabled', enabled: false });
+  await popup({ type: 'set-enabled', enabled: true });
+  await chrome.windows.onFocusChanged.emit(window.id);
+  await permissionPause();
+  assert.equal(connections.length, permissionConnections, 'OFF must cancel the pending permission return, including after re-enabling');
+
+  await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
+  await popup({ type: 'request-input-access' });
+  await chrome.windows.onFocusChanged.emit(chrome.windows.WINDOW_ID_NONE);
+  await connection.onMessage.emit({ type: 'input-status', status: 'ready' });
+  await chrome.windows.onFocusChanged.emit(window.id);
+  await permissionPause();
+  assert.equal(connections.length, permissionConnections, 'A host that becomes ready must not restart on return');
+
+  await connection.onMessage.emit({ type: 'input-status', status: 'permission-required' });
+  await popup({ type: 'request-input-access' });
+  await chrome.windows.onFocusChanged.emit(chrome.windows.WINDOW_ID_NONE);
+  connection.closed = true;
+  await connection.onDisconnect.emit();
+  await chrome.alarms.onAlarm.emit({ name: 'native-reconnect' });
+  assert.equal(connections.length, ++permissionConnections);
+  await chrome.windows.onFocusChanged.emit(window.id);
+  await permissionPause();
+  assert.equal(connections.length, permissionConnections, 'An unexpected disconnect must clear a pending permission return');
+
   const beforeForged = reads;
   await chrome.runtime.onMessage.emit({ type: 'context-changed' }, { id: 'other-extension', frameId: 0, tab: { active: true }, url: 'https://example.com/' });
   await chrome.runtime.onMessage.emit({ type: 'context-changed' }, { id: 'extension-id', frameId: 1, tab: { active: true }, url: 'https://example.com/' });
@@ -495,5 +573,5 @@ vm.runInContext(source, sandbox);
   contentChrome.runtime.sendMessage = () => { throw new Error('Extension context invalidated'); };
   page.y++;
   assert.doesNotThrow(() => handlers['window:scroll'](), 'An unloaded extension must not throw errors into the page');
-  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; status validation and disconnect reset; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
+  console.log('PASS: fresh/correlated context; verified tab/window fallback for internal or inaccessible pages without DOM injection/leakage; scheme/privacy boundaries and transition invalidation; negative/fractional coordinates and scaling; invalid windows/tabs, navigation, incognito, zoom/script failures; storage read/write recovery; strict popup controls, serialized/duplicate explicit states and disabled startup/reconnect; explicit-only permission request with trusted popup, enabled and permission-required guards; one-shot settings-return reconnect with failed-send, focus, OFF, ready and old-port guards; status validation and disconnect reset; pending reads across OFF; native port isolation; passive page events without DOM writes; forged/iframe messages rejected.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

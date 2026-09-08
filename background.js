@@ -3,16 +3,20 @@ let port;
 let timer;
 let revision = 0;
 let inputStatus = 'disconnected';
+let permissionReturn;
+let reconnectTimer;
 const state = () => ({ enabled, inputStatus });
 
 function updateInputStatus(status) {
+  if (['ready', 'off', 'disconnected'].includes(status)) permissionReturn = undefined;
   if (inputStatus === status) return;
   inputStatus = status;
   void chrome.runtime.sendMessage({ type: 'input-status', ...state() }).catch(() => {});
 }
 
 function send(message) {
-  try { port?.postMessage(message); } catch { /* Reconnect on the next alarm. */ }
+  if (!port) return false;
+  try { port.postMessage(message); return true; } catch { /* Reconnect on the next alarm. */ return false; }
 }
 
 function unavailable(window, tabId) {
@@ -91,7 +95,7 @@ function refresh(invalidate = false) {
 }
 
 function connect() {
-  if (port) return;
+  if (port || reconnectTimer) return;
   try {
     const connection = chrome.runtime.connectNative('com.iknowit.bridge');
     port = connection;
@@ -134,6 +138,7 @@ function setEnabled(value) {
   const operation = changing.then(async () => {
     if (enabled === value) { connect(); return state(); }
     enabled = value;
+    if (!enabled) permissionReturn = undefined;
     inputStatus = enabled ? 'disconnected' : 'off';
     revision++;
     clearTimeout(timer);
@@ -157,7 +162,20 @@ chrome.tabs.onUpdated.addListener((_id, changes, tab) => {
   if (tab.active && (changes.status || changes.url || changes.title)) refresh(true);
 });
 chrome.tabs.onZoomChange.addListener(() => refresh());
-chrome.windows.onFocusChanged.addListener(() => refresh(true));
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (permissionReturn && enabled && port) {
+    if (windowId === chrome.windows.WINDOW_ID_NONE) permissionReturn.blurred = true;
+    else if (Number.isInteger(windowId) && windowId >= 0 && permissionReturn.blurred) {
+      // macOS caches an earlier Input Monitoring denial until the host exits.
+      const connection = port;
+      port = undefined;
+      updateInputStatus('disconnected');
+      reconnectTimer = setTimeout(() => { reconnectTimer = undefined; connect(); }, 100);
+      try { connection.disconnect(); } catch { /* The host may already have exited. */ }
+    }
+  }
+  refresh(true);
+});
 chrome.windows.onBoundsChanged.addListener(() => refresh(true));
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'context-changed' && sender?.id === chrome.runtime.id
@@ -168,7 +186,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     || sender.tab !== undefined || (message.type === 'set-enabled' && typeof message.enabled !== 'boolean')) return;
   const operation = message.type === 'set-enabled' ? setEnabled(message.enabled) : changing.then(() => {
     if (message.type === 'request-input-access' && enabled && inputStatus === 'permission-required') {
-      send({ type: 'request-input-access' });
+      if (send({ type: 'request-input-access' })) permissionReturn = { blurred: false };
     }
     return state();
   });

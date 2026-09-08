@@ -53,7 +53,11 @@ const server = http.createServer((_request, response) => {
   try {
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const profile = path.join(temporary, 'profile');
-    fs.mkdirSync(profile);
+    fs.mkdirSync(path.join(profile, 'Default'), { recursive: true });
+    // Match a normal unpacked install. CDP's initial install bypasses developer
+    // mode, but runtime.reload uses a fresh installer without that exemption.
+    const preferences = path.join(profile, 'Default', 'Preferences');
+    fs.writeFileSync(preferences, JSON.stringify({ extensions: { ui: { developer_mode: true } } }));
     child = spawn(chromium.executablePath(), ['--no-sandbox', '--no-first-run', '--no-default-browser-check',
       '--disable-dev-shm-usage', '--enable-unsafe-extension-debugging', '--remote-debugging-port=0',
       `--user-data-dir=${profile}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -95,6 +99,9 @@ const server = http.createServer((_request, response) => {
     let worker = context.serviceWorkers().find(worker => worker.url().startsWith(workerURL))
       || await context.waitForEvent('serviceworker', { predicate: worker => worker.url().startsWith(workerURL) });
     await worker.evaluate(async () => { await __contextTest.ready; });
+    assert.equal(JSON.parse(fs.readFileSync(preferences, 'utf8')).extensions?.ui?.developer_mode, true);
+    assert.equal((await browserSession.send('Extensions.getExtensions')).extensions
+      .find(item => item.id === installed.id)?.enabled, true, 'The fixture extension must start enabled');
     const tabId = await worker.evaluate(async url => (await chrome.tabs.query({})).find(tab => tab.url === url)?.id, page.url());
     assert(Number.isInteger(tabId));
     const installedCollector = await worker.evaluate(async id => {
@@ -288,7 +295,9 @@ const server = http.createServer((_request, response) => {
     }, tabId);
     const workerBeforeReload = await worker.evaluate(() => performance.timeOrigin);
     const closedWorkers = new Set();
-    const trackWorker = candidate => candidate.once('close', () => closedWorkers.add(candidate));
+    const trackWorker = candidate => {
+      if (candidate.url().startsWith(workerURL)) candidate.once('close', () => closedWorkers.add(candidate));
+    };
     context.serviceWorkers().forEach(trackWorker);
     context.on('serviceworker', trackWorker);
     // MV3 idle restart can reuse a handle; whole-extension reload can detach it.
@@ -302,7 +311,7 @@ const server = http.createServer((_request, response) => {
           while (Date.now() < reloadDeadline) {
             assert(browser.isConnected() && !page.isClosed(), 'The fixture browser and page must survive extension reload');
             for (const candidate of context.serviceWorkers()) {
-              if (closedWorkers.has(candidate)) continue;
+              if (!candidate.url().startsWith(workerURL) || closedWorkers.has(candidate)) continue;
               let observed;
               try {
                 observed = await candidate.evaluate(async ({ id, before }) => {
@@ -346,6 +355,8 @@ const server = http.createServer((_request, response) => {
       console.error(JSON.stringify({ check: 'extension-reload-inventory', inventory }));
       throw error;
     } finally { clearTimeout(readyTimeout); context.off('serviceworker', trackWorker); }
+    assert.equal((await browserSession.send('Extensions.getExtensions')).extensions
+      .find(item => item.id === installed.id)?.enabled, true, 'runtime.reload must leave the extension enabled');
     const reloadedCollector = await worker.evaluate(async id => {
       const results = await chrome.scripting.executeScript({ target: { tabId: id }, func: () => ({
         oldMarker: globalThis.__contextBeforeReload === true,

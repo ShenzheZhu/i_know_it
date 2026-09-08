@@ -17,7 +17,6 @@ browser_dirs=(
   "$HOME/Library/Application Support/Google/ChromeForTesting/NativeMessagingHosts"
 )
 [[ -f "$source_dir/native/main.swift" ]] || { echo "Missing native/main.swift." >&2; exit 1; }
-compiler_path="$(/usr/bin/xcrun --find swiftc)"
 [[ ! -L "$install_dir" && ! -L "$host_path" && ! -L "$receipt_path" ]] || { echo "Refusing to replace a symbolic link." >&2; exit 1; }
 [[ ! -e "$host_path" || -f "$host_path" ]] || { echo "Refusing to replace a non-file: $host_path" >&2; exit 1; }
 receipt_value() { /usr/bin/plutil -extract "$1" raw -o - "$receipt_path" 2>/dev/null || true; }
@@ -76,24 +75,24 @@ hash_file() {
 }
 cp "$source_dir/native/main.swift" "$build_dir/main.swift"
 source_hash="$(hash_file "$build_dir/main.swift")"
-compiler_version="$(/usr/bin/xcrun swiftc --version)"
-compiler_hash="$(hash_file "$compiler_path")"
-compiler_identity="$compiler_path
-$compiler_version
-$compiler_hash"
 architecture="$(uname -m)"
 installed_hash=""
 [[ ! -f "$host_path" ]] || installed_hash="$(hash_file "$host_path")"
 reuse=false
 if [[ -f "$receipt_path" && -f "$host_path" && -x "$host_path" &&
       "$(receipt_value source_sha256)" == "$source_hash" &&
-      "$(receipt_value compiler)" == "$compiler_identity" &&
       "$(receipt_value architecture)" == "$architecture" &&
       "$(receipt_value executable_sha256)" == "$installed_hash" ]]; then
   reuse=true
   chmod 755 "$host_path"
   chmod 600 "$receipt_path"
 else
+  compiler_path="$(/usr/bin/xcrun --find swiftc)"
+  compiler_version="$(/usr/bin/xcrun swiftc --version)"
+  compiler_hash="$(hash_file "$compiler_path")"
+  compiler_identity="$compiler_path
+$compiler_version
+$compiler_hash"
   /usr/bin/xcrun swiftc "$build_dir/main.swift" -o "$build_dir/i-know-it-host"
   chmod 755 "$build_dir/i-know-it-host"
   /usr/bin/plutil -create xml1 "$build_dir/install-receipt.json"

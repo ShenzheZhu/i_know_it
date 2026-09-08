@@ -96,6 +96,31 @@ try {
   assert.match(repeated.stdout, /Reused the unchanged native executable/);
   pass('real Swift installation writes a private receipt; unchanged reinstall preserves executable and receipt bytes and mtime');
 
+  const installer = path.join(basic.source, 'install.sh');
+  const installerText = fs.readFileSync(installer, 'utf8');
+  const compilerStub = path.join(basic.source, 'xcrun-fixture');
+  assert(installerText.includes('/usr/bin/xcrun'));
+  fs.writeFileSync(installer, installerText.replaceAll('/usr/bin/xcrun', '"$source_dir/xcrun-fixture"'));
+  for (const toolchain of ['updated', 'unavailable']) {
+    fs.writeFileSync(compilerStub, '#!/bin/bash\nprintf "%s\\n" "$*" >> "$0.calls"\n' + (toolchain === 'updated'
+      ? 'if [[ "$1" == --find ]]; then printf "%s\\n" "$0"; elif [[ "$2" == --version ]]; then echo "Swift version fixture-updated"; else exit 91; fi\n'
+      : 'exit 91\n'), { mode: 0o755 });
+    const reused = run(basic, 'install.sh');
+    assert.match(reused.stdout, /Reused the unchanged native executable/);
+    unchanged([basic.host, basic.receipt], initial);
+    verifyInstalled(basic, expectedID);
+    assert(!fs.existsSync(`${compilerStub}.calls`), `${toolchain} compiler must not be consulted for verified reuse`);
+  }
+  const beforeMissingCompiler = snapshot([basic.host, basic.receipt, ...basic.manifests]);
+  fs.appendFileSync(path.join(basic.source, 'native/main.swift'), '\n// A changed source still needs a compiler.\n');
+  run(basic, 'install.sh', [], false);
+  assert(fs.existsSync(`${compilerStub}.calls`), 'Changed source must require the compiler');
+  unchanged([basic.host, basic.receipt, ...basic.manifests], beforeMissingCompiler);
+  verifyInstalled(basic, expectedID);
+  fs.writeFileSync(path.join(basic.source, 'native/main.swift'), originalSwift);
+  fs.writeFileSync(installer, installerText);
+  pass('verified native reuse needs no compiler, retains original build metadata, and unavailable tools cannot replace a changed-source installation');
+
   const installedFiles = [basic.host, basic.receipt, ...basic.manifests];
   const beforeFailure = snapshot(installedFiles);
   fs.writeFileSync(path.join(basic.source, 'native/main.swift'), 'This intentionally does not compile.\n');
@@ -110,15 +135,16 @@ try {
   unchanged([basic.host, basic.receipt], initial);
   pass('extension ID updates both browser registrations while retaining the unchanged native executable');
 
-  for (const change of ['source', 'compiler', 'architecture', 'corrupt executable', 'missing executable', 'missing receipt']) {
+  for (const change of ['source', 'architecture', 'corrupt executable', 'non-executable host', 'missing executable', 'missing receipt']) {
     const oldReceipt = JSON.parse(fs.readFileSync(basic.receipt));
     fs.utimesSync(basic.host, 1, 1);
     if (change === 'source') fs.appendFileSync(path.join(basic.source, 'native/main.swift'), '\n// Installer source-change fixture.\n');
-    if (change === 'compiler' || change === 'architecture') {
+    if (change === 'architecture') {
       oldReceipt[change] = 'Different build environment';
       fs.writeFileSync(basic.receipt, JSON.stringify(oldReceipt));
     }
     if (change === 'corrupt executable') fs.appendFileSync(basic.host, 'Modified executable bytes');
+    if (change === 'non-executable host') fs.chmodSync(basic.host, 0o600);
     if (change === 'missing executable') fs.unlinkSync(basic.host);
     if (change === 'missing receipt') fs.unlinkSync(basic.receipt);
     const rebuilt = run(basic, 'install.sh', ['a'.repeat(32)]);
@@ -128,11 +154,9 @@ try {
     const sourceHash = crypto.createHash('sha256').update(fs.readFileSync(path.join(basic.source, 'native/main.swift'))).digest('hex');
     assert.equal(JSON.parse(fs.readFileSync(basic.receipt)).source_sha256, sourceHash);
   }
-  pass('source, compiler, architecture, corruption, missing executable, and legacy unreceipted installs rebuild');
+  pass('source, architecture, corruption, non-executable or missing host, and legacy unreceipted installs rebuild');
 
   const beforePublishFailure = snapshot(installedFiles);
-  const installer = path.join(basic.source, 'install.sh');
-  const installerText = fs.readFileSync(installer, 'utf8');
   const publishReceipt = 'mv -f -- "$build_dir/install-receipt.json" "$receipt_path"';
   assert(installerText.includes(publishReceipt));
   fs.writeFileSync(installer, installerText.replace(publishReceipt, 'false # Injected receipt publication failure.'));

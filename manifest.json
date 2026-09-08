@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "I Know It!",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "minimum_chrome_version": "120",
   "description": "Add source context to ordinary screenshots through a local background companion.",
   "permissions": [
@@ -21,7 +21,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "I Know It! — On. Click to turn off."
+    "default_title": "I Know It! \u2014 On. Click to turn off."
   },
   "content_scripts": [
     {

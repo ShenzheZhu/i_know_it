@@ -8,7 +8,8 @@
     ]);
     if (current === previous) return;
     previous = current;
-    chrome.runtime.sendMessage({ type: 'context-changed' }).catch(() => {});
+    try { chrome.runtime.sendMessage({ type: 'context-changed' }).catch(() => {}); }
+    catch { /* The extension may have been reloaded or removed. */ }
   }
   for (const event of ['scroll', 'resize', 'hashchange', 'popstate', 'pageshow']) {
     addEventListener(event, report, { passive: true });

@@ -57,6 +57,10 @@ A separate integration check is available as `node check-browser.cjs` after inst
 
 The September 7, 2026 run on macOS 26.6.2 / Chrome for Testing 151.0.7922.34 verified a real native-host context request, an ordinary paste containing both PNG and Markdown with identical bytes, and toolbar ON/OFF without a new tab. This does not establish native Codex composer acceptance.
 
+For an automated artifact check using Codex CLI, run `node check-agent.cjs` with Playwright and an authenticated `codex` command available. Set `CODEX_BINARY` if the CLI is installed elsewhere. This calls Codex with a generated test image, so normal account usage applies. The check compiles the real native clipboard engine with a private-pasteboard fixture, verifies byte preservation and Retina dimensions, and asks Codex to read a random visual code and the generated Markdown. It never opens Codex desktop or changes the system clipboard.
+
+On September 8, 2026, this check passed: Codex CLI read the image code, observed URL, 1200 × 800 dimensions, and unknown crop origin correctly. Additional regression checks found and fixed stale screenshots being reapplied after clipboard ownership loss and old replies reaching a replacement native connection. Extension invalidation also now leaves passive page handlers silent. Malformed input, message-size limits, late replies, disabling, and reconnect checks pass. Native Codex desktop acceptance is still blocked by the available automation policy; a CLI result does not prove the desktop paste flow.
+
 ## License
 
 MIT.

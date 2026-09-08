@@ -32,6 +32,7 @@ function pageContext() {
 }
 
 async function readContext(version, requestId) {
+  const recipient = port;
   let context = unavailable();
   try {
     if (!enabled) throw new Error('Disabled');
@@ -57,6 +58,7 @@ async function readContext(version, requestId) {
       }
     }
   } catch { /* Restricted pages and closing tabs have no page context. */ }
+  if (port !== recipient) return;
   if (requestId) {
     send({ ...(enabled && version === revision ? context : unavailable()), requestId });
   } else if (enabled && version === revision) send(context);
@@ -80,7 +82,7 @@ function connect() {
       if (port === connection) port = undefined;
     });
     connection.onMessage.addListener((message) => {
-      if (message?.type !== 'request-context') return;
+      if (port !== connection || message?.type !== 'request-context') return;
       if (typeof message.requestId === 'string' && message.requestId.length <= 128) {
         void readContext(revision, message.requestId);
       } else refresh();

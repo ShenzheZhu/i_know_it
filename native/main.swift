@@ -103,6 +103,10 @@ final class Bridge {
     }
     func restore() {
         if ownsClipboard(), let original { original.restore(board) }
+        else {
+            // Ownership loss also cancels pending work; never reapply an old image over a newer copy.
+            original = nil; files = nil; browser = nil; requestID = nil
+        }
         owned = nil; ownershipToken = nil; seen = board.changeCount
     }
     func ownsClipboard() -> Bool {
@@ -211,13 +215,20 @@ func send(_ message: [String: Any]) throws {
     var framed = Data(bytes: &count, count: 4); framed.append(data)
     try FileHandle.standardOutput.write(contentsOf: framed)
 }
-func readExactly(_ count: Int) -> Data? {
+func readExactly(_ count: Int, from input: FileHandle = .standardInput) -> Data? {
     var data = Data()
     while data.count < count {
-        guard let part = try? FileHandle.standardInput.read(upToCount: count - data.count), !part.isEmpty else { return nil }
+        guard let part = try? input.read(upToCount: count - data.count), !part.isEmpty else { return nil }
         data.append(part)
     }
     return data
+}
+func readMessage(from input: FileHandle = .standardInput) -> [String: Any]? {
+    guard let header = readExactly(4, from: input) else { return nil }
+    let length = header.enumerated().reduce(UInt32(0)) { $0 | UInt32($1.element) << ($1.offset * 8) }
+    guard length > 0, length <= 1_048_576, let payload = readExactly(Int(length), from: input),
+          let value = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { return nil }
+    return value
 }
 
 func selfTest() throws {
@@ -268,7 +279,8 @@ func selfTest() throws {
     // Reproduce a newer copy racing the post-write count read: a matching count alone is insufficient.
     bridge.owned = board.changeCount
     let replacedCount = board.changeCount; bridge.restore()
-    assert(board.changeCount == replacedCount && board.pasteboardItems?.first?.string(forType: marker) == "another owner")
+    bridge.tick()
+    assert(board.changeCount == replacedCount && board.pasteboardItems?.first?.string(forType: marker) == "another owner" && bridge.original == nil)
     bridge.setEnabled(false)
     let file = directory.appendingPathComponent("not-a-directory")
     try Data("file".utf8).write(to: file)
@@ -296,7 +308,75 @@ func selfTest() throws {
         let count = board.changeCount; bridge.tick()
         assert(board.changeCount == count && bridge.original == nil && board.pasteboardItems?.first?.string(forType: .fileURL) == url.absoluteString)
     }
-    print("PASS: PNG preservation, upright TIFF pixels, oriented TIFF/JPEG passthrough, immediate attachment and late context, restore/toggle/ownership, text/multiple items, and disk failure.")
+    func reject(_ entry: NSPasteboardItem) {
+        board.clearContents(); board.writeObjects([entry])
+        let count = board.changeCount; bridge.tick()
+        assert(board.changeCount == count && bridge.original == nil && bridge.owned == nil)
+    }
+    let malformed = NSPasteboardItem(); malformed.setData(Data("not an image".utf8), forType: .png); reject(malformed)
+    for type in [marker, NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"), NSPasteboard.PasteboardType("org.nspasteboard.TransientType")] {
+        let entry = NSPasteboardItem(); entry.setData(png, forType: .png); entry.setString("private", forType: type)
+        reject(entry); assert(board.data(forType: .png) == png)
+    }
+    let oversized = directory.appendingPathComponent("oversized.png"), empty = directory.appendingPathComponent("empty.png")
+    try Data().write(to: oversized); try Data().write(to: empty)
+    let sparse = try FileHandle(forWritingTo: oversized); try sparse.truncate(atOffset: 100_000_001); try sparse.close()
+    for url in [oversized, empty, directory, directory.appendingPathComponent("missing.png")] {
+        let entry = NSPasteboardItem(); entry.setString(url.absoluteString, forType: .fileURL); reject(entry)
+    }
+    let wide = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 32_769, pixelsHigh: 1, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    wide.bitmapData!.initialize(repeating: 0, count: wide.bytesPerRow)
+    let wideItem = NSPasteboardItem(); wideItem.setData(wide.representation(using: .png, properties: [:])!, forType: .png); reject(wideItem)
+
+    // A reply for an older copy must not update a prepared file or attribute the replacement image.
+    app = "com.google.Chrome"; putImage(); bridge.tick()
+    let pendingReply = reply.merging(["requestId": requested]) { _, new in new }
+    app = "com.openai.codex"; bridge.tick()
+    let pendingFile = bridge.files!.last!, pendingData = try Data(contentsOf: pendingFile)
+    board.clearContents(); board.setString("replacement text", forType: .string)
+    let newCount = board.changeCount; bridge.receive(pendingReply)
+    let unchanged = try Data(contentsOf: pendingFile)
+    assert(board.changeCount == newCount && board.string(forType: .string) == "replacement text" && bridge.browser == nil && bridge.requestID == nil && unchanged == pendingData)
+    app = "com.google.Chrome"; putImage(); bridge.tick()
+    let disabledReply = reply.merging(["requestId": requested]) { _, new in new }
+    app = "com.openai.codex"; bridge.tick(); bridge.setEnabled(false)
+    let offCount = board.changeCount; bridge.receive(disabledReply); bridge.tick()
+    assert(board.changeCount == offCount && board.data(forType: .png) == png && bridge.browser == nil)
+    bridge.setEnabled(true); bridge.tick(); assert(board.changeCount == offCount)
+    app = "com.google.Chrome"; putImage(); bridge.tick()
+    let oldReply = reply.merging(["requestId": requested]) { _, new in new }
+    putImage(); bridge.tick(); let latestID = bridge.requestID
+    bridge.receive(oldReply)
+    assert(bridge.requestID == latestID && bridge.browser == nil && board.data(forType: .png) == png)
+    bridge.receive(["type": "browser-context", "requestId": latestID!, "available": false])
+    assert(bridge.requestID == nil && bridge.browser == nil)
+    app = "com.openai.codex"; bridge.tick(); assert(bridge.ownsClipboard())
+    board.clearContents(); board.setString("copy before switching apps", forType: .string)
+    app = "com.apple.TextEdit"; bridge.tick(); app = "com.openai.codex"; bridge.tick()
+    assert(board.string(forType: .string) == "copy before switching apps" && bridge.original == nil)
+
+    func frame(_ payload: Data, length: UInt32? = nil) -> Data {
+        var size = (length ?? UInt32(payload.count)).littleEndian
+        var data = Data(bytes: &size, count: 4); data.append(payload); return data
+    }
+    let frameFile = directory.appendingPathComponent("native-input")
+    var maximum = Data("{}".utf8); maximum.append(Data(repeating: 32, count: 1_048_574))
+    for (data, valid) in [
+        (frame(Data("{}".utf8)), true), (frame(maximum), true),
+        (Data([1, 2, 3]), false), (frame(Data()), false),
+        (frame(Data(), length: 1_048_577), false), (frame(Data("{".utf8), length: 2), false),
+        (frame(Data("{".utf8)), false), (frame(Data("[]".utf8)), false), (frame(Data([0xff])), false),
+    ] {
+        try data.write(to: frameFile)
+        let input = try FileHandle(forReadingFrom: frameFile)
+        let message = readMessage(from: input); try input.close()
+        assert((message != nil) == valid)
+    }
+    try (frame(Data("{}".utf8)) + frame(Data("{\"type\":\"enabled\",\"enabled\":false}".utf8))).write(to: frameFile)
+    let input = try FileHandle(forReadingFrom: frameFile)
+    let first = readMessage(from: input), second = readMessage(from: input), end = readMessage(from: input); try input.close()
+    assert(first != nil && second?["enabled"] as? Bool == false && end == nil)
+    print("PASS: image preservation, malformed/oversized/concealed input, native framing limits, stale replies, immediate attachment, late context, restore/toggle/newer-copy ownership, and disk failure.")
 }
 
 if CommandLine.arguments.contains("--self-test") {
@@ -325,10 +405,7 @@ let signalSources = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
 let timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in bridge.tick() }
 let observer = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in bridge.tick() }
 Thread.detachNewThread {
-    while let header = readExactly(4) {
-        let length = header.enumerated().reduce(UInt32(0)) { $0 | UInt32($1.element) << ($1.offset * 8) }
-        guard length > 0, length <= 1_048_576, let payload = readExactly(Int(length)),
-              let value = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { break }
+    while let value = readMessage() {
         DispatchQueue.main.async { bridge.receive(value) }
     }
     DispatchQueue.main.async { shutdown() }

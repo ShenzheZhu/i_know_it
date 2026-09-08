@@ -409,9 +409,13 @@ func estimatePageRegion(_ region: RegionObservation, context: GestureContext) ->
     let windowRect = CGRect(x: left, y: top, width: outerWidth, height: outerHeight)
     let origin = CGPoint(x: screenX - clientX * zoom, y: screenY - clientY * zoom)
     let contentRect = CGRect(x: origin.x, y: origin.y, width: width * zoom, height: height * zoom)
+    // Real Chrome PointerEvent client coordinates have Float32 precision: fractional
+    // zoom produced sub-0.001-point edge drift. Larger display/crop overflows stay unknown.
+    let edgeEpsilon: CGFloat = 0.001
     guard valid(windowRect), valid(contentRect), valid(region.display.bounds), valid(region.globalRect),
           windowRect.insetBy(dx: -1, dy: -1).contains(contentRect),
-          region.display.bounds.contains(contentRect), contentRect.contains(region.globalRect) else { return nil }
+          region.display.bounds.insetBy(dx: -edgeEpsilon, dy: -edgeEpsilon).contains(contentRect),
+          contentRect.insetBy(dx: -edgeEpsilon, dy: -edgeEpsilon).contains(region.globalRect) else { return nil }
     let viewportRect = CGRect(x: (region.globalRect.minX - origin.x) / zoom,
                               y: (region.globalRect.minY - origin.y) / zoom,
                               width: region.globalRect.width / zoom, height: region.globalRect.height / zoom)
@@ -1165,6 +1169,52 @@ func regionSelfTest() {
     let negativeEstimate = estimatePageRegion(pageRegion(CGRect(x: -1580, y: 120, width: 200, height: 100), display: negativeDisplay),
                                               context: negativePage)
     check(negativeEstimate?.viewportRect == CGRect(x: 160, y: 80, width: 160, height: 80), "negative-origin secondary display mapping")
+    // Independently paired Chrome pointer/DOM and AX target measurements from this Mac.
+    let realDisplay = RegionDisplay(id: 1, bounds: CGRect(x: 0, y: 0, width: 1470, height: 956), scale: 2)
+    for (zoom, dpr, client, size, target, cssTarget): (CGFloat, CGFloat, CGPoint, CGSize, CGRect, CGRect) in [
+        (0.9, 1.7999999523162842, CGPoint(x: 445.97222900390625, y: 249.8611297607422), CGSize(width: 1633, height: 748),
+         CGRect(x: 36, y: 294, width: 360, height: 180), CGRect(x: 40, y: 131.0069580078125, width: 400.0000305175781, height: 200.00001525878906)),
+        (1.25, 2.5, CGPoint(x: 321.1000061035156, y: 179.90000915527344), CGSize(width: 1176, height: 538),
+         CGRect(x: 50, y: 339, width: 500, height: 251), CGRect(x: 40, y: 130.6374969482422, width: 400, height: 200))
+    ] {
+        var observed = pageContext(zoom: zoom)
+        observed.browser?["devicePixelRatio"] = dpr
+        observed.browser?["viewport"] = ["width": size.width, "height": size.height]
+        observed.browser?["scroll"] = ["x": 0, "y": 0]
+        observed.browser?["window"] = ["focused": true, "state": "normal", "left": 0, "top": 33, "width": 1470, "height": 816]
+        observed.browser?["pageWindow"] = ["screenX": 0, "screenY": 33, "outerWidth": 1470, "outerHeight": 816]
+        observed.browser?["pointerAnchor"] = ["screen": ["x": 401.375, "y": 400.875],
+                                              "client": ["x": client.x, "y": client.y], "ageMs": 50, "observedAt": iso(pageDate)]
+        let estimate = estimatePageRegion(pageRegion(target, display: realDisplay), context: observed)
+        check(estimate != nil, "real 90/125 percent samples accept Float32 display-edge drift")
+        check(abs(estimate!.origin.x) < 0.001 && abs(estimate!.origin.y - 176) < 0.001, "real measured content origin retained without rounding")
+        check(abs(estimate!.viewportRect.minX - cssTarget.minX) <= 1 && abs(estimate!.viewportRect.minY - cssTarget.minY) <= 1
+              && abs(estimate!.viewportRect.width - cssTarget.width) <= 1 && abs(estimate!.viewportRect.height - cssTarget.height) <= 1,
+              "real AX target maps within one CSS pixel including AX integer rounding")
+    }
+    for edge in 0..<4 {
+        for overflow: CGFloat in [0.0009, 0.0011] {
+            var boundary = CGRect(x: 140, y: 220, width: 800, height: 400)
+            switch edge {
+            case 0: boundary.origin.x += overflow; boundary.size.width -= overflow
+            case 1: boundary.size.width -= overflow
+            case 2: boundary.origin.y += overflow; boundary.size.height -= overflow
+            default: boundary.size.height -= overflow
+            }
+            let tightDisplay = RegionDisplay(id: 1, bounds: boundary, scale: 2)
+            check((estimatePageRegion(pageRegion(display: tightDisplay), context: pageContext()) != nil) == (overflow < 0.001),
+                  "display edge accepts only sub-0.001-point overflow on every side")
+            var crop = CGRect(x: 140, y: 220, width: 800, height: 400)
+            switch edge {
+            case 0: crop.origin.x -= overflow; crop.size.width += overflow
+            case 1: crop.size.width += overflow
+            case 2: crop.origin.y -= overflow; crop.size.height += overflow
+            default: crop.size.height += overflow
+            }
+            check((estimatePageRegion(pageRegion(crop), context: pageContext()) != nil) == (overflow < 0.001),
+                  "crop edge accepts only sub-0.001-point overflow on every side")
+        }
+    }
     print("PASS: \(checks) passive region state checks; no event tap, UI, screenshot, or clipboard access")
 }
 

@@ -21,13 +21,26 @@ for (width, height) in sizes {
   let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
   bitmap.bitmapData!.initialize(repeating: 127, count: bitmap.bytesPerRow * height)
   let png = bitmap.representation(using: .png, properties: [:])!
-  let bridge = Bridge(board: board, directory: root.appendingPathComponent("size-\\(width)-\\(height)"), currentApp: { "com.openai.codex" }, request: { _ in })
+  var app = "com.google.Chrome", requestID = ""
+  let bridge = Bridge(board: board, directory: root.appendingPathComponent("size-\\(width)-\\(height)"), currentApp: { app }, request: { requestID = $0 })
+  var now: TimeInterval = 100
+  bridge.clock = { now }
+  bridge.displays = { [RegionDisplay(id: 1, bounds: CGRect(x: 0, y: 0, width: 16384, height: 16384), scale: 1)] }
   bridge.setEnabled(true)
+  // Test-only direct method calls; no OS input is posted and no event tap is opened.
+  bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
+  bridge.receive(["type": "browser-context", "requestId": requestID, "available": true,
+      "url": "https://example.invalid/image-size", "window": ["focused": true, "left": 0, "top": 0, "width": 16384, "height": 16384]])
+  bridge.observeGesture(type: .flagsChanged, flags: [])
+  bridge.observeGesture(type: .leftMouseDown, flags: [], location: CGPoint(x: 10, y: 10))
+  now += 0.2
+  bridge.observeGesture(type: .leftMouseUp, flags: [], location: CGPoint(x: 10 + width, y: 10 + height))
   board.clearContents(); board.setData(png, forType: .png)
+  app = "com.openai.codex"
   bridge.tick(); assert(bridge.ownsClipboard(), "Missing image at \\(width)x\\(height)")
   let saved = try Data(contentsOf: bridge.files![0])
   let md = try String(contentsOf: bridge.files![1], encoding: .utf8)
-  assert(saved == png && md.contains("\\(width) × \\(height)"))
+  assert(saved == png && md.contains("\\(width) × \\(height)") && md.contains("Observed screenshot selection"))
   bridge.setEnabled(false); assert(board.data(forType: .png) == png)
   results.append(["width":width,"height":height,"pngBytes":png.count,"result":"PASS"])
  }

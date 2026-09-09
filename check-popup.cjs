@@ -87,7 +87,7 @@ const server = http.createServer((req, res) => {
     const page = await context.newPage();
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
-    const control = page.getByRole('switch', { name: 'Screenshot context' });
+    const control = page.getByRole('switch', { name: 'Chrome screenshot context' });
     await page.waitForFunction(() => !document.querySelector('#enabled').disabled);
     assert(await control.isChecked()); assert.equal(writes, 0, 'Opening the popup must not flip the switch');
     assert.equal(await page.locator('#status').textContent(), 'ON');

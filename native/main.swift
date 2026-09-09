@@ -347,6 +347,27 @@ struct GestureContext {
     var geometryInvalidated = false
 }
 
+func isChromeSelection(_ region: RegionObservation, context: GestureContext) -> Bool {
+    guard let browser = context.browser, browserObservation(browser, app: context.app) != nil,
+          let window = browser["window"] as? [String: Any],
+          let focused = window["focused"] as? NSNumber,
+          CFGetTypeID(focused) == CFBooleanGetTypeID(), focused.boolValue else { return false }
+    func number(_ key: String) -> CGFloat? {
+        guard let value = window[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+              value.doubleValue.isFinite else { return nil }
+        return CGFloat(value.doubleValue)
+    }
+    guard let x = number("left"), let y = number("top"),
+          let width = number("width"), let height = number("height"), width > 0, height > 0 else { return false }
+    let windowRect = CGRect(x: x, y: y, width: width, height: height), selection = region.globalRect
+    guard [windowRect.maxX, windowRect.maxY, selection.minX, selection.minY,
+           selection.maxX, selection.maxY].allSatisfy({ $0.isFinite }),
+          selection.width > 0, selection.height > 0 else { return false }
+    // Window APIs can round by one display point; bounds cannot establish window occlusion.
+    return selection.minX >= windowRect.minX - 1 && selection.minY >= windowRect.minY - 1 &&
+           selection.maxX <= windowRect.maxX + 1 && selection.maxY <= windowRect.maxY + 1
+}
+
 struct PageRegionEstimate {
     let origin: CGPoint
     let viewportRect: CGRect
@@ -569,6 +590,12 @@ final class Bridge {
     func observeGesture(type: CGEventType, flags: CGEventFlags, keycode: Int64 = 0,
                         isRepeat: Bool = false, location: CGPoint = .zero) {
         guard enabled else { cancelGesture(); return }
+        guard gesture.isArmed || browserApps.contains(currentApp() ?? "") else { return }
+        if owned != nil, !gesture.isArmed, type == .keyDown, !isRepeat,
+           gesture.shortcut?.matches(keycode: Int(keycode), flags: flags) == true {
+            // Settle our previous handoff before sampling the next screenshot's clipboard generation.
+            restore()
+        }
         let now = clock()
         if gesture.observe(type: type, flags: flags, keycode: Int(keycode), isRepeat: isRepeat,
                            location: location, clipboardCount: clipboardCount(), displays: displays(), now: now) {
@@ -593,14 +620,16 @@ final class Bridge {
     }
     func suspendCapture() {
         guard let image = original, !image.items.contains(where: { $0[.fileURL] != nil }),
-              let region, let context = regionContext, let epoch = captureEpoch, let items = captureItems else { return }
+              let region, let context = regionContext, isChromeSelection(region, context: context),
+              let epoch = captureEpoch, let items = captureItems else { return }
         suspended = SuspendedCapture(generation: seen, items: items, epoch: epoch, suspendedAt: clock(),
             image: image, region: region, context: context, observedAt: observedAt, observedApp: observedApp,
             browser: browser, files: files, owned: owned, ownershipToken: ownershipToken)
     }
     func recoverSuspended(_ generation: Int) -> Bool {
         guard let saved = suspended, generation == saved.generation else { return false }
-        guard pasteboardEpoch() == saved.epoch else { suspended = nil; recoveryPending = false; return false }
+        guard isChromeSelection(saved.region, context: saved.context),
+              pasteboardEpoch() == saved.epoch else { suspended = nil; recoveryPending = false; return false }
         var missing = false
         let items = completePasteboardItems(board, expected: saved.items, onMissingData: { missing = true })
         guard clipboardCount() == generation, pasteboardEpoch() == saved.epoch, clipboardCount() == generation else {
@@ -762,8 +791,15 @@ final class Bridge {
             // An external copy always replaces our pending work; never restore over a newer copy.
             owned = nil; ownershipToken = nil; original = nil; files = nil; browser = nil; requestID = nil
             region = nil; regionContext = nil; regionDiagnostic = nil; captureEpoch = nil; captureItems = nil
+            // Only a shortcut observed in Chrome can admit a new image. Do this before reading pixels/files.
+            guard let context = gestureContext, browserApps.contains(context.app ?? "") else {
+                seen = count; deferredImage = nil; cancelGesture(); return
+            }
             // Clearing and filling a pasteboard can share one change count. Wait for its contents.
             guard let entries = board.pasteboardItems, !entries.isEmpty else { return }
+            guard entries.count == 1, !entries[0].types.contains(.fileURL) else {
+                seen = count; deferredImage = nil; cancelGesture(); return
+            }
             // A system writer can advertise PNG/TIFF before supplying its bytes at the same generation.
             // Retry only missing declared image bytes, for at most two seconds, before any decode.
             if entries.count == 1, !entries[0].types.contains(.fileURL), !entries[0].types.contains(marker),
@@ -775,17 +811,13 @@ final class Bridge {
             }
             deferredImage = nil; seen = count
             guard let image = ClipboardImage(board), clipboardCount() == count else { cancelGesture(); return }
+            guard let matched = gesture.consume(width: image.width, height: image.height, clipboardCount: count,
+                                                displays: displays(), now: clock()),
+                  isChromeSelection(matched, context: context) else { cancelGesture(); return }
             original = image; observedAt = Date(); observedApp = currentApp()
-            region = gesture.consume(width: image.width, height: image.height, clipboardCount: count, displays: displays(), now: clock())
-            if region == nil { regionDiagnostic = gesture.diagnostic }
-            if region != nil {
-                suspended = nil; regionContext = gestureContext; browser = gestureContext?.browser
-                captureEpoch = pasteboardEpoch(); rememberRepresentations()
-            }
+            region = matched; regionContext = context; browser = context.browser; suspended = nil
+            captureEpoch = pasteboardEpoch(); rememberRepresentations()
             cancelGesture()
-            if region == nil && browserApps.contains(observedApp ?? "") {
-                let id = UUID().uuidString; requestID = id; request(id)
-            }
         }
         guard let image = original else { return }
         if !targetApps.contains(currentApp() ?? "") { if owned != nil { restore() }; return }
@@ -1465,29 +1497,63 @@ func selfTest() throws {
     let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 3, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
     for x in 0..<4 { for y in 0..<3 { bitmap.setColor(NSColor(deviceRed: CGFloat(x) / 4, green: CGFloat(y) / 3, blue: 0.9, alpha: 1), atX: x, y: y) } }
     let png = bitmap.representation(using: .png, properties: [:])!
-    func putImage() { board.clearContents(); board.setData(png, forType: .png) }
-    var app = "com.google.Chrome", requested = ""
+    let tiff = bitmap.representation(using: .tiff, properties: [:])!
+    var app = "com.google.Chrome", requested = "", now: TimeInterval = 1000
     let bridge = Bridge(board: board, directory: directory, currentApp: { app }, request: { requested = $0 })
-    bridge.setEnabled(true); putImage(); bridge.tick()
-    assert(!requested.isEmpty && bridge.owned == nil && board.data(forType: .png) == png)
-    let reply: [String: Any] = ["type": "browser-context", "requestId": requested, "available": true, "url": "https://example.com/settings", "title": "Title\n# content", "observedAt": iso(Date()), "window": ["focused": true], "viewport": ["width": 1200, "height": 800]]
+    let testDisplays = [RegionDisplay(id: 7, bounds: CGRect(x: -100, y: -50, width: 500, height: 400), scale: 1)]
+    func selectionReply(_ id: String, url: String = "https://example.com/source-a") -> [String: Any] {
+        ["type": "browser-context", "requestId": id, "available": true, "url": url,
+         "observedAt": iso(Date()), "window": ["focused": true, "state": "normal", "left": -90, "top": -40, "width": 450, "height": 350]]
+    }
+    func putImage() { board.clearContents(); board.setData(png, forType: .png) }
+    // Local method calls and a private pasteboard only: no event posting, UI or global clipboard.
+    @discardableResult
+    func armScreenshot(_ target: Bridge, reply: ((String) -> [String: Any])? = { selectionReply($0) },
+                       start: CGPoint = CGPoint(x: -80, y: -20), end: CGPoint = CGPoint(x: -76, y: -17)) -> String {
+        target.clock = { now }; target.displays = { testDisplays }; now += 10
+        target.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
+        let id = target.gestureContext?.id ?? ""
+        if !id.isEmpty, let reply { target.receive(reply(id)) }
+        target.observeGesture(type: .flagsChanged, flags: [])
+        target.observeGesture(type: .leftMouseDown, flags: [], location: start)
+        target.observeGesture(type: .leftMouseDragged, flags: [], location: CGPoint(x: -78.25, y: -18.75))
+        now += 0.2
+        target.observeGesture(type: .leftMouseUp, flags: [], location: end)
+        return id
+    }
+    @discardableResult
+    func putScreenshot(_ target: Bridge, data: Data? = nil, type: NSPasteboard.PasteboardType = .png,
+                       reply: ((String) -> [String: Any])? = { selectionReply($0) }) -> String {
+        let destination = app; app = "com.google.Chrome"; target.tick()
+        let id = armScreenshot(target, reply: reply)
+        board.clearContents(); board.setData(data ?? png, forType: type); app = destination
+        return id
+    }
+    func untouched(_ target: Bridge, count: Int, items: [[NSPasteboard.PasteboardType: Data]], _ label: String) {
+        target.tick()
+        assert(board.changeCount == count && completePasteboardItems(board) == items, label)
+        assert(target.original == nil && target.files == nil && target.owned == nil, label)
+    }
+    bridge.setEnabled(true)
+    let initialID = putScreenshot(bridge, reply: { id in
+        selectionReply(id, url: "https://example.com/settings").merging(["title": "Title\n# content"]) { _, new in new }
+    })
+    bridge.tick()
+    assert(!initialID.isEmpty && bridge.region != nil && bridge.owned == nil && board.data(forType: .png) == png)
     app = "com.openai.codex"; bridge.tick()
-    assert(board.pasteboardItems?.count == 2 && bridge.ownsClipboard() && bridge.requestID != nil)
-    let urls = board.pasteboardItems!.compactMap { $0.string(forType: .fileURL) }.compactMap(URL.init(string:))
-    let savedPNG = try Data(contentsOf: urls[0]); assert(savedPNG == png)
-    let initialMD = try String(contentsOf: urls[1], encoding: .utf8)
-    assert(initialMD.contains("Browser context: unavailable"))
-    let own = board.changeCount
-    bridge.receive(reply)
-    assert(board.changeCount == own && bridge.requestID == nil)
-    let md = try String(contentsOf: urls[1], encoding: .utf8)
-    assert(md.contains("https://example.com/settings") && md.contains("4 × 3") && md.contains("Title\\n# content"))
-    bridge.tick(); assert(board.changeCount == own)
+    assert(board.pasteboardItems?.count == 2 && bridge.ownsClipboard() && bridge.requestID == nil)
+    let urls = bridge.files!, savedPNG = try Data(contentsOf: urls[0])
+    assert(savedPNG == png)
+    let initialMD = try String(contentsOf: urls[1], encoding: .utf8), own = board.changeCount
+    assert(initialMD.contains("https://example.com/settings") && initialMD.contains("4 × 3") && initialMD.contains("Title\\n# content"))
+    bridge.receive(selectionReply(initialID, url: "https://example.com/late")); bridge.tick()
+    let unchangedMD = try String(contentsOf: urls[1], encoding: .utf8)
+    assert(board.changeCount == own && unchangedMD == initialMD, "A post-image reply cannot rewrite frozen context")
     app = "com.apple.TextEdit"; bridge.tick(); assert(board.data(forType: .png) == png)
     app = "com.openai.codex"; bridge.tick(); assert(board.pasteboardItems?.count == 2)
     bridge.setEnabled(false); assert(board.data(forType: .png) == png)
     let disabled = board.changeCount; bridge.tick(); assert(board.changeCount == disabled)
-    bridge.setEnabled(true); putImage(); bridge.tick()
+    bridge.setEnabled(true); putScreenshot(bridge); bridge.tick()
     board.clearContents(); board.setString("new user copy", forType: .string)
     bridge.setEnabled(false); assert(board.string(forType: .string) == "new user copy")
     bridge.setEnabled(true); bridge.tick()
@@ -1495,27 +1561,25 @@ func selfTest() throws {
     let multiple = (0..<2).map { _ -> NSPasteboardItem in
         let item = NSPasteboardItem(); item.setData(png, forType: .png); return item
     }
+    app = "com.google.Chrome"; armScreenshot(bridge)
     board.clearContents(); board.writeObjects(multiple)
     let multipleCount = board.changeCount; bridge.tick()
     assert(board.changeCount == multipleCount && board.pasteboardItems?.count == 2 && bridge.original == nil)
-    putImage(); bridge.tick(); assert(bridge.ownsClipboard())
+    app = "com.openai.codex"; putScreenshot(bridge); bridge.tick(); assert(bridge.ownsClipboard())
     let replacement = (0..<2).map { _ -> NSPasteboardItem in
         let item = NSPasteboardItem(); item.setString("another owner", forType: marker); return item
     }
-    board.clearContents(); board.writeObjects(replacement)
-    // Reproduce a newer copy racing the post-write count read: a matching count alone is insufficient.
-    bridge.owned = board.changeCount
-    let replacedCount = board.changeCount; bridge.restore()
-    bridge.tick()
+    board.clearContents(); board.writeObjects(replacement); bridge.owned = board.changeCount
+    let replacedCount = board.changeCount; bridge.restore(); bridge.tick()
     assert(board.changeCount == replacedCount && board.pasteboardItems?.first?.string(forType: marker) == "another owner" && bridge.original == nil)
     bridge.setEnabled(false)
     let file = directory.appendingPathComponent("not-a-directory")
     try Data("file".utf8).write(to: file)
     let failing = Bridge(board: board, directory: file, currentApp: { app }, request: { _ in })
-    failing.setEnabled(true); putImage(); let diskCount = board.changeCount; failing.tick()
+    failing.setEnabled(true); putScreenshot(failing); let diskCount = board.changeCount; failing.tick()
     assert(board.changeCount == diskCount && board.data(forType: .png) == png && failing.original == nil)
-    let tiff = bitmap.representation(using: .tiff, properties: [:])!
-    bridge.setEnabled(true); board.clearContents(); board.setData(tiff, forType: .tiff); bridge.tick()
+    failing.setEnabled(false)
+    bridge.setEnabled(true); putScreenshot(bridge, data: tiff, type: .tiff); bridge.tick()
     let converted = bridge.original!, pixels = NSBitmapImageRep(data: converted.png)!, tiffPixels = NSBitmapImageRep(data: tiff)!
     assert(converted.width == 4 && converted.height == 3 && bridge.ownsClipboard())
     for x in 0..<4 { for y in 0..<3 {
@@ -1524,63 +1588,168 @@ func selfTest() throws {
         assert(abs(before.redComponent - after.redComponent) < 1.0 / 255 && abs(before.greenComponent - after.greenComponent) < 1.0 / 255 && abs(before.blueComponent - after.blueComponent) < 1.0 / 255 && before.alphaComponent == after.alphaComponent)
     } }
     bridge.setEnabled(false); assert(board.data(forType: .tiff) == tiff)
-    for (type, orientation) in [(UTType.tiff, 6), (UTType.jpeg, 1)] {
-        let data = NSMutableData(), url = directory.appendingPathComponent("unchanged.\(type.preferredFilenameExtension!)")
-        let destination = CGImageDestinationCreateWithData(data, type.identifier as CFString, 1, nil)!
-        CGImageDestinationAddImage(destination, bitmap.cgImage!, [kCGImagePropertyOrientation: orientation] as CFDictionary)
-        let finalized = CGImageDestinationFinalize(destination); assert(finalized)
-        try (data as Data).write(to: url)
-        let entry = NSPasteboardItem(); entry.setString(url.absoluteString, forType: .fileURL)
-        bridge.setEnabled(true); board.clearContents(); board.writeObjects([entry])
-        let count = board.changeCount; bridge.tick()
-        assert(board.changeCount == count && bridge.original == nil && board.pasteboardItems?.first?.string(forType: .fileURL) == url.absoluteString)
+
+    // Restore our preceding pair before the next shortcut samples its clipboard generation.
+    for ordering in ["restore-before-shortcut", "restore-before-drag", "restore-after-mouseup", "new-external-generation"] {
+        bridge.setEnabled(false); app = "com.openai.codex"; bridge.setEnabled(true)
+        putScreenshot(bridge); bridge.tick(); assert(bridge.ownsClipboard())
+        let priorFiles = bridge.files!, priorContext = bridge.regionContext!.id
+        let captureFolders = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        app = "com.google.Chrome"
+        if ordering == "restore-before-shortcut" { bridge.tick() }
+        if ordering == "new-external-generation" {
+            board.clearContents(); board.setString("new external copy", forType: .string)
+            board.setData(Data([1, 2, 3]), forType: NSPasteboard.PasteboardType("com.iknowit.external-fixture"))
+        }
+        let externalCount = board.changeCount, externalItems = completePasteboardItems(board)!
+        now += 10
+        bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
+        let nextID = bridge.gestureContext!.id, shortcutBaseline = board.changeCount
+        bridge.receive(selectionReply(nextID))
+        if ordering == "restore-before-drag" { bridge.tick() }
+        bridge.observeGesture(type: .flagsChanged, flags: [])
+        bridge.observeGesture(type: .leftMouseDown, flags: [], location: CGPoint(x: -80, y: -20))
+        now += 0.2
+        bridge.observeGesture(type: .leftMouseUp, flags: [], location: CGPoint(x: -76, y: -17))
+        if ordering == "restore-after-mouseup" { bridge.tick() }
+        if ordering == "new-external-generation" {
+            app = "com.openai.codex"
+            untouched(bridge, count: externalCount, items: externalItems, "Restoring our pair must never overwrite a newer external generation")
+            let afterFolders = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            assert(Set(afterFolders) == Set(captureFolders), "No new files for an external copy")
+        } else {
+            putImage()
+            assert(board.changeCount == shortcutBaseline + 1, "Own restoration must precede shortcut baseline: \(ordering)")
+            app = "com.openai.codex"; bridge.tick()
+            assert(bridge.ownsClipboard() && bridge.regionContext?.id == nextID && nextID != priorContext,
+                   "Next screenshot retains its own region after focus/restore ordering: \(ordering)")
+            assert(bridge.files != priorFiles && (try! Data(contentsOf: bridge.files![0])) == png,
+                   "The next screenshot receives a fresh artifact pair: \(ordering)")
+        }
+        bridge.setEnabled(false)
     }
-    func reject(_ entry: NSPasteboardItem) {
+    print("PASS: 4 own-restoration ordering cases; next screenshot baseline and newer external clipboard ownership are preserved.")
+
+    // Ordinary image copies never acquire metadata, regardless of app transitions.
+    var scopeChecks = 0
+    for source in ["com.google.Chrome", "com.apple.TextEdit", "com.apple.finder", "com.openai.codex"] {
+        for target in ["com.google.Chrome", "com.openai.codex"] {
+            for type in [NSPasteboard.PasteboardType.png, .tiff] {
+                bridge.setEnabled(false); app = source; bridge.setEnabled(true)
+                board.clearContents(); board.setData(type == .png ? png : tiff, forType: type)
+                let count = board.changeCount, items = completePasteboardItems(board)!
+                untouched(bridge, count: count, items: items, "Plain image in \(source)")
+                app = target; untouched(bridge, count: count, items: items, "Plain image after app switch")
+                scopeChecks += 1
+            }
+        }
+    }
+    for source in ["com.apple.TextEdit", "com.apple.finder", "com.openai.codex", "com.apple.Safari", "org.mozilla.firefox", "com.google.Chrome.helper", "com.google.ChromeEvil"] {
+        bridge.setEnabled(false); app = source; bridge.setEnabled(true)
+        armScreenshot(bridge); assert(!bridge.gesture.isArmed && bridge.gestureContext == nil)
+        putImage(); let count = board.changeCount, items = completePasteboardItems(board)!
+        app = "com.google.Chrome"; untouched(bridge, count: count, items: items, "Other-app screenshot cannot become Chrome after focus")
+        app = "com.openai.codex"; untouched(bridge, count: count, items: items, "Other-app screenshot paste")
+        scopeChecks += 1
+    }
+    for source in browserApps.sorted() {
+        bridge.setEnabled(false); app = source; bridge.setEnabled(true)
+        let id = armScreenshot(bridge); assert(!id.isEmpty)
+        putImage(); app = "com.openai.codex"; bridge.tick()
+        assert(bridge.ownsClipboard() && bridge.regionContext?.app == source, "Each configured Chrome family is supported")
+        scopeChecks += 1
+    }
+    for mixPNG in [false, true] {
+        bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true); armScreenshot(bridge)
+        let url = directory.appendingPathComponent("copied-file.png"); try png.write(to: url)
+        let entry = NSPasteboardItem(); entry.setString(url.absoluteString, forType: .fileURL)
+        if mixPNG { entry.setData(png, forType: .png) }
+        board.clearContents(); board.writeObjects([entry]); let count = board.changeCount, items = completePasteboardItems(board)!
+        app = "com.openai.codex"; untouched(bridge, count: count, items: items, "File copy is never a screenshot")
+        scopeChecks += 1
+    }
+    // Invalid window measurements fail closed even with a matching Chrome gesture and image.
+    let coveringWindow: [String: Any] = ["focused": true, "state": "normal", "left": -90, "top": -40, "width": 450, "height": 350]
+    var invalidWindows: [[String: Any]?] = [nil, [:], coveringWindow.merging(["focused": false]) { _, new in new }]
+    for value: Any in [1, "true", NSNull()] {
+        invalidWindows.append(coveringWindow.merging(["focused": value]) { _, new in new })
+    }
+    var missingFocus = coveringWindow; missingFocus["focused"] = nil; invalidWindows.append(missingFocus)
+    for field in ["left", "top", "width", "height"] {
+        var missing = coveringWindow; missing[field] = nil; invalidWindows.append(missing)
+        for value: Any in [true, "40", Double.nan, Double.infinity] {
+            invalidWindows.append(coveringWindow.merging([field: value]) { _, new in new })
+        }
+    }
+    for changes: [String: Any] in [["width": 0], ["height": -1], ["left": -78.9], ["top": -18.9], ["width": 12.9], ["height": 21.9]] {
+        invalidWindows.append(coveringWindow.merging(changes) { _, new in new })
+    }
+    for window in invalidWindows {
+        bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
+        armScreenshot(bridge, reply: { id in var reply = selectionReply(id); reply["window"] = window; return reply })
+        putImage(); let count = board.changeCount, items = completePasteboardItems(board)!
+        app = "com.openai.codex"; untouched(bridge, count: count, items: items, "Missing/malformed/outside Chrome window")
+        scopeChecks += 1
+    }
+    for window: [String: Any] in [coveringWindow,
+        ["focused": true, "left": -79, "top": -19, "width": 2, "height": 1]] {
+        bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
+        armScreenshot(bridge, reply: { id in selectionReply(id).merging(["window": window]) { _, new in new } })
+        putImage(); app = "com.openai.codex"; bridge.tick()
+        assert(bridge.ownsClipboard(), "Inclusive one-display-point containment boundary")
+        scopeChecks += 1
+    }
+    for reason in ["no-reply", "late-reply", "unavailable", "expired", "mismatch", "cancel", "double-copy"] {
+        bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
+        let id = armScreenshot(bridge, reply: ["no-reply", "late-reply"].contains(reason) ? nil : { id in
+            selectionReply(id).merging(reason == "unavailable" ? ["available": false] : [:]) { _, new in new }
+        }, end: reason == "mismatch" ? CGPoint(x: -73, y: -17) : CGPoint(x: -76, y: -17))
+        if reason == "expired" { now += 2.1 }
+        if reason == "cancel" { bridge.observeGesture(type: .keyDown, flags: [], keycode: 49) }
+        if reason == "double-copy" { board.clearContents(); board.setString("intermediate", forType: .string) }
+        putImage(); let count = board.changeCount, items = completePasteboardItems(board)!
+        app = "com.openai.codex"; untouched(bridge, count: count, items: items, reason)
+        bridge.receive(selectionReply(id)); untouched(bridge, count: count, items: items, "Late reply cannot promote \(reason)")
+        scopeChecks += 1
+    }
+    bridge.setEnabled(false)
+    print("PASS: \(scopeChecks) Chrome-only scope cases; plain images, other apps, copied files, invalid source windows and uncorrelated captures stay unchanged.")
+
+    func reject(_ entry: NSPasteboardItem, decoded: Bool = false) {
+        bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true); armScreenshot(bridge)
         board.clearContents(); board.writeObjects([entry])
-        let count = board.changeCount; bridge.tick()
+        if decoded { assert(ClipboardImage(board) == nil, "Decoder must reject invalid input independently of scope gate") }
+        let count = board.changeCount; app = "com.openai.codex"; bridge.tick()
         assert(board.changeCount == count && bridge.original == nil && bridge.owned == nil)
     }
-    let malformed = NSPasteboardItem(); malformed.setData(Data("not an image".utf8), forType: .png); reject(malformed)
+    let malformed = NSPasteboardItem(); malformed.setData(Data("not an image".utf8), forType: .png); reject(malformed, decoded: true)
     for type in [marker, NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"), NSPasteboard.PasteboardType("org.nspasteboard.TransientType")] {
         let entry = NSPasteboardItem(); entry.setData(png, forType: .png); entry.setString("private", forType: type)
-        reject(entry); assert(board.data(forType: .png) == png)
+        reject(entry, decoded: true); assert(board.data(forType: .png) == png)
     }
-    let oversized = directory.appendingPathComponent("oversized.png"), empty = directory.appendingPathComponent("empty.png")
-    try Data().write(to: oversized); try Data().write(to: empty)
-    let sparse = try FileHandle(forWritingTo: oversized); try sparse.truncate(atOffset: 100_000_001); try sparse.close()
-    for url in [oversized, empty, directory, directory.appendingPathComponent("missing.png")] {
-        let entry = NSPasteboardItem(); entry.setString(url.absoluteString, forType: .fileURL); reject(entry)
+    for (type, orientation) in [(UTType.tiff, 6), (UTType.jpeg, 1)] {
+        let data = NSMutableData()
+        let writer = CGImageDestinationCreateWithData(data, type.identifier as CFString, 1, nil)!
+        CGImageDestinationAddImage(writer, bitmap.cgImage!, [kCGImagePropertyOrientation: orientation] as CFDictionary)
+        assert(CGImageDestinationFinalize(writer))
+        let entry = NSPasteboardItem(); entry.setData(data as Data, forType: type == .tiff ? .tiff : .png); reject(entry, decoded: true)
     }
     let wide = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 32_769, pixelsHigh: 1, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
     wide.bitmapData!.initialize(repeating: 0, count: wide.bytesPerRow)
-    let wideItem = NSPasteboardItem(); wideItem.setData(wide.representation(using: .png, properties: [:])!, forType: .png); reject(wideItem)
-
-    // A reply for an older copy must not update a prepared file or attribute the replacement image.
-    app = "com.google.Chrome"; putImage(); bridge.tick()
-    let pendingReply = reply.merging(["requestId": requested]) { _, new in new }
-    app = "com.openai.codex"; bridge.tick()
-    let pendingFile = bridge.files!.last!, pendingData = try Data(contentsOf: pendingFile)
+    let wideItem = NSPasteboardItem(); wideItem.setData(wide.representation(using: .png, properties: [:])!, forType: .png); reject(wideItem, decoded: true)
+    for url in [directory, directory.appendingPathComponent("missing.png")] {
+        let entry = NSPasteboardItem(); entry.setString(url.absoluteString, forType: .fileURL); reject(entry)
+    }
+    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
+    let oldID = putScreenshot(bridge); bridge.tick(); app = "com.openai.codex"; bridge.tick()
+    let pendingFile = bridge.files![1], pendingData = try Data(contentsOf: pendingFile)
     board.clearContents(); board.setString("replacement text", forType: .string)
-    let newCount = board.changeCount; bridge.receive(pendingReply)
-    let unchanged = try Data(contentsOf: pendingFile)
-    assert(board.changeCount == newCount && board.string(forType: .string) == "replacement text" && bridge.browser == nil && bridge.requestID == nil && unchanged == pendingData)
-    app = "com.google.Chrome"; putImage(); bridge.tick()
-    let disabledReply = reply.merging(["requestId": requested]) { _, new in new }
-    app = "com.openai.codex"; bridge.tick(); bridge.setEnabled(false)
-    let offCount = board.changeCount; bridge.receive(disabledReply); bridge.tick()
+    let newCount = board.changeCount; bridge.receive(selectionReply(oldID)); bridge.tick()
+    let preserved = try Data(contentsOf: pendingFile)
+    assert(board.changeCount == newCount && board.string(forType: .string) == "replacement text" && bridge.original == nil && preserved == pendingData)
+    putScreenshot(bridge); bridge.tick(); bridge.setEnabled(false)
+    let offCount = board.changeCount; bridge.receive(selectionReply(requested)); bridge.tick()
     assert(board.changeCount == offCount && board.data(forType: .png) == png && bridge.browser == nil)
-    bridge.setEnabled(true); bridge.tick(); assert(board.changeCount == offCount)
-    app = "com.google.Chrome"; putImage(); bridge.tick()
-    let oldReply = reply.merging(["requestId": requested]) { _, new in new }
-    putImage(); bridge.tick(); let latestID = bridge.requestID
-    bridge.receive(oldReply)
-    assert(bridge.requestID == latestID && bridge.browser == nil && board.data(forType: .png) == png)
-    bridge.receive(["type": "browser-context", "requestId": latestID!, "available": false])
-    assert(bridge.requestID == nil && bridge.browser == nil)
-    app = "com.openai.codex"; bridge.tick(); assert(bridge.ownsClipboard())
-    board.clearContents(); board.setString("copy before switching apps", forType: .string)
-    app = "com.apple.TextEdit"; bridge.tick(); app = "com.openai.codex"; bridge.tick()
-    assert(board.string(forType: .string) == "copy before switching apps" && bridge.original == nil)
 
     func frame(_ payload: Data, length: UInt32? = nil) -> Data {
         var size = (length ?? UInt32(payload.count)).littleEndian
@@ -1603,86 +1772,56 @@ func selfTest() throws {
     let input = try FileHandle(forReadingFrom: frameFile)
     let first = readMessage(from: input), second = readMessage(from: input), end = readMessage(from: input); try input.close()
     assert(first != nil && second?["enabled"] as? Bool == false && end == nil)
-    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true); putImage(); bridge.tick()
+    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true); putScreenshot(bridge); bridge.tick()
     board.clearContents(); board.setString("copy before duplicate enable", forType: .string)
     bridge.receive(["type": "enabled", "enabled": true]); app = "com.openai.codex"; bridge.tick()
     assert(board.string(forType: .string) == "copy before duplicate enable", "Duplicate enable resurrected an older screenshot")
 
-    // A screenshot writer can clear first, then supply PNG data without another change count.
-    app = "com.google.Chrome"; putImage(); bridge.tick()
-    board.clearContents(); bridge.tick()
-    assert(bridge.original == nil && bridge.requestID == nil)
-    board.setData(png, forType: .png); bridge.tick()
-    assert(bridge.original?.png == png && bridge.requestID != nil, "Delayed clipboard data was skipped")
-    board.clearContents(); bridge.tick(); board.setString("delayed text", forType: .string)
-    app = "com.openai.codex"; bridge.tick()
-    assert(board.string(forType: .string) == "delayed text" && bridge.original == nil)
-
-    // Basic tab/window metadata remains useful when Chrome forbids page script injection.
+    // Metadata is supplied at shortcut time; it never promotes a later ordinary copy.
+    func captureReply(_ changes: [String: Any]) {
+        bridge.setEnabled(false); app = "com.openai.codex"; bridge.setEnabled(true)
+        putScreenshot(bridge, reply: { id in selectionReply(id).merging(changes) { _, new in new } }); bridge.tick()
+    }
     for (url, reason) in [("chrome://extensions/", "browser-internal-page"), ("https://example.com/restricted", "page-read-failed")] {
-        app = "com.google.Chrome"; putImage(); bridge.tick()
-        bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
-                        "pageAvailable": false, "pageUnavailableReason": reason, "url": url, "title": "Observed tab",
-                        "viewport": ["width": 999], "scroll": ["y": 999], "devicePixelRatio": 2,
-                        "pointerAnchor": ["screen": ["x": 10, "y": 10]],
-                        "pointerCalibration": ["status": "ready"],
-                        "pageWindow": ["outerWidth": 1200], "fullscreen": false,
-                        "window": ["focused": true, "left": -1200, "top": 40, "width": 1200, "height": 800]])
+        captureReply(["pageAvailable": false, "pageUnavailableReason": reason, "url": url, "title": "Observed tab",
+                      "viewport": ["width": 999], "scroll": ["y": 999], "devicePixelRatio": 2,
+                      "pointerAnchor": ["screen": ["x": 10, "y": 10]], "pointerCalibration": ["status": "ready"],
+                      "pageWindow": ["outerWidth": 1200], "fullscreen": false])
         let partial = bridge.markdown(bridge.original!)
-        assert(partial.contains(quoted(url)) && partial.contains("Observed tab") && partial.contains("-1200"))
+        assert(partial.contains(quoted(url)) && partial.contains("Observed tab"))
         assert(partial.contains("Page measurements: unavailable") && !partial.contains("Viewport (CSS px)"))
-        assert(partial.contains("Screenshot source and crop origin: unknown"))
         assert(bridge.browser?["pointerAnchor"] == nil && bridge.browser?["pointerCalibration"] == nil && bridge.browser?["pageWindow"] == nil && bridge.browser?["fullscreen"] == nil)
     }
     for url in ["file:///private/screenshot.png", "javascript:alert(1)", "data:text/html,private", "chrome:extensions"] {
-        app = "com.google.Chrome"; putImage(); bridge.tick()
-        bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
-                        "url": url, "window": ["focused": true]])
-        assert(bridge.browser == nil, "Unsupported or malformed browser URL was accepted")
+        captureReply(["url": url])
+        assert(bridge.original == nil && bridge.files == nil && bridge.browser == nil && board.data(forType: .png) == png)
     }
-    app = "com.google.Chrome"; putImage(); bridge.tick()
-    bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
-                    "pageAvailable": true, "url": "https://example.com/", "window": ["focused": true],
-                    "pointerCalibration": ["status": "unfocused-pointer", "enabled": true,
-                                           "visibility": "visible", "focused": true]])
+    captureReply(["pageAvailable": true, "pointerCalibration": ["status": "unfocused-pointer", "enabled": true,
+                                                               "visibility": "visible", "focused": true]])
     let missingCalibrationMD = bridge.markdown(bridge.original!)
     assert(missingCalibrationMD.contains("- Pointer calibration state:") && missingCalibrationMD.contains("unfocused-pointer"))
-    assert(!missingCalibrationMD.contains("Estimated selection") && !missingCalibrationMD.contains("- Pointer calibration:"),
-           "Missing-calibration diagnostics must not invent an anchor or an estimate")
+    assert(!missingCalibrationMD.contains("Estimated selection") && !missingCalibrationMD.contains("- Pointer calibration:"))
     for (state, expectedState, expectedFullscreen): (Any?, String, String) in [
         ("normal", "normal", "false"), ("minimized", "minimized", "false"),
         ("maximized", "maximized", "false"), ("fullscreen", "fullscreen", "true"),
         (nil, "unknown", "unknown"), ("unexpected", "unknown", "unknown"), (1, "unknown", "unknown")
     ] {
-        app = "com.google.Chrome"; putImage(); bridge.tick()
-        var window: [String: Any] = ["focused": true]
-        window["state"] = state
-        bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
-                        "pageAvailable": true, "url": "https://example.com/", "window": window, "fullscreen": false])
+        var window = coveringWindow; window["state"] = state
+        captureReply(["pageAvailable": true, "window": window, "fullscreen": false])
         let md = bridge.markdown(bridge.original!)
-        assert(md.contains("- Browser window state: \(expectedState)\n"))
-        assert(md.contains("- Browser window fullscreen: \(expectedFullscreen)\n"))
+        assert(md.contains("- Browser window state: \(expectedState)\n") && md.contains("- Browser window fullscreen: \(expectedFullscreen)\n"))
         assert(md.contains("- Document element fullscreen: false") && !md.contains("- fullscreen:"))
     }
     for (value, expected): (Any, String) in [(true, "true"), (false, "false"), (1, "unknown"), ("true", "unknown"), (NSNull(), "unknown")] {
-        app = "com.google.Chrome"; putImage(); bridge.tick()
-        bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
-                        "pageAvailable": true, "url": "https://example.com/", "fullscreen": value,
-                        "window": ["focused": true, "state": "normal"]])
+        captureReply(["pageAvailable": true, "fullscreen": value])
         let md = bridge.markdown(bridge.original!)
         assert(md.contains("- Browser window fullscreen: false") && md.contains("- Document element fullscreen: \(expected)\n"))
     }
-    app = "com.google.Chrome"; putImage(); bridge.tick()
-    bridge.receive(["type": "browser-context", "requestId": requested, "available": true,
-                    "pageAvailable": true, "url": "chrome://extensions/", "fullscreen": true,
-                    "window": ["focused": true, "state": "fullscreen"]])
+    captureReply(["pageAvailable": true, "url": "chrome://extensions/", "fullscreen": true,
+                  "window": coveringWindow.merging(["state": "fullscreen"]) { _, new in new }])
     let internalFullscreenMD = bridge.markdown(bridge.original!)
     assert(internalFullscreenMD.contains("- Browser window fullscreen: true") && internalFullscreenMD.contains("- Document element fullscreen: unknown"))
-
-    // Exercise the real bridge with decoded input and a private pasteboard, never a global tap.
-    var now: TimeInterval = 1000
-    bridge.clock = { now }
-    bridge.displays = { [RegionDisplay(id: 7, bounds: CGRect(x: -100, y: -50, width: 500, height: 400), scale: 1)] }
+    bridge.clock = { now }; bridge.displays = { testDisplays }
     func startSelection(replyBeforeEnd: Bool = false,
                         start: CGPoint = CGPoint(x: -80, y: -20),
                         end: CGPoint = CGPoint(x: -76, y: -17),
@@ -1702,10 +1841,6 @@ func selfTest() throws {
         now += 0.2
         bridge.observeGesture(type: .leftMouseUp, flags: [], location: end)
         return id
-    }
-    func selectionReply(_ id: String, url: String = "https://example.com/source-a") -> [String: Any] {
-        ["type": "browser-context", "requestId": id, "available": true, "url": url,
-         "observedAt": iso(Date()), "window": ["focused": true]]
     }
     func pageReply(_ id: String) -> [String: Any] {
         var reply = selectionReply(id)
@@ -1743,42 +1878,29 @@ func selfTest() throws {
     assert(board.data(forType: .png) == png && bridge.region == nil && !bridge.gesture.isArmed)
 
     let lateID = startSelection()
-    putImage(); app = "com.openai.codex"; bridge.tick()
-    assert(bridge.region != nil && bridge.browser == nil)
-    bridge.receive(selectionReply(lateID))
-    assert(bridge.browser == nil, "Post-selection replies must not become screenshot context")
-    let lateRegionMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
-    assert(!lateRegionMD.contains("source-a"))
+    putImage(); app = "com.openai.codex"; let lateCount = board.changeCount; bridge.tick()
+    assert(bridge.region == nil && bridge.original == nil && bridge.files == nil && board.changeCount == lateCount)
+    bridge.receive(selectionReply(lateID)); bridge.tick()
+    assert(bridge.original == nil && board.changeCount == lateCount, "Post-selection context cannot grant screenshot eligibility")
     board.clearContents(); board.setString("new copy", forType: .string)
-    bridge.receive(selectionReply(lateID, url: "https://example.com/too-late"))
-    bridge.tick()
+    bridge.receive(selectionReply(lateID, url: "https://example.com/too-late")); bridge.tick()
     assert(board.string(forType: .string) == "new copy" && bridge.region == nil)
-
-    let slowID = startSelection()
-    now += 1.1
-    bridge.receive(selectionReply(slowID, url: "https://example.com/too-late"))
+    _ = startSelection(beforeMouseDown: { id in now += 1.1; bridge.receive(selectionReply(id)) })
     putImage(); bridge.tick()
-    assert(bridge.region != nil && bridge.browser == nil, "Delayed page B must not become shortcut context")
-    _ = startSelection()
+    assert(bridge.original == nil && bridge.browser == nil, "A reply older than the shortcut reply window is not source evidence")
+    _ = startSelection(replyBeforeEnd: true)
     bridge.observeGesture(type: .keyDown, flags: [], keycode: 49)
     putImage(); bridge.tick()
-    assert(bridge.region == nil && bridge.requestID != nil, "Window/move mode cannot produce guessed geometry")
-    assert(bridge.markdown(bridge.original!).contains("Unsupported or out-of-sequence input cancelled selection tracking."))
-
-    _ = startSelection(start: CGPoint(x: -80.25, y: -20.25), end: CGPoint(x: -75.75, y: -16.5))
+    assert(bridge.region == nil && bridge.original == nil && bridge.files == nil, "Unsupported window/move mode has no generic fallback")
+    _ = startSelection(replyBeforeEnd: true, start: CGPoint(x: -80.25, y: -20.25), end: CGPoint(x: -75.75, y: -16.5))
     putImage(); app = "com.openai.codex"; bridge.tick()
     assert(bridge.region?.globalRect == CGRect(x: -80.25, y: -20.25, width: 4.5, height: 3.75))
     let fractionalMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
-    assert(fractionalMD.contains("x=-80.25") && fractionalMD.contains("width=4.5, height=3.75"))
-    assert(fractionalMD.contains("not the exact image crop rectangle"))
-    _ = startSelection(end: CGPoint(x: -73, y: -17))
-    putImage(); app = "com.openai.codex"; bridge.tick()
-    assert(bridge.region == nil && bridge.regionDiagnostic?.contains("rounding tolerance") == true)
-    let mismatchMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
-    assert(mismatchMD.contains("- Last selection tracking status (may predate this image):") && mismatchMD.contains("rounding tolerance"))
-    assert(!mismatchMD.contains("Observed raw drag extent"))
+    assert(fractionalMD.contains("x=-80.25") && fractionalMD.contains("width=4.5, height=3.75") && fractionalMD.contains("not the exact image crop rectangle"))
+    _ = startSelection(replyBeforeEnd: true, end: CGPoint(x: -73, y: -17))
+    putImage(); app = "com.openai.codex"; let mismatchCount = board.changeCount; bridge.tick()
+    assert(bridge.region == nil && bridge.original == nil && bridge.files == nil && board.changeCount == mismatchCount)
     bridge.setEnabled(false)
-
     let invalidate: [String: Any] = ["type": "browser-geometry-invalidated"]
     for stage in ["before-reply", "after-reply", "during-drag", "after-mouse-up", "after-match-before-file", "after-file-write"] {
         let invalidBeforeCapture = ["before-reply", "after-reply", "during-drag", "after-mouse-up"].contains(stage)
@@ -1846,8 +1968,7 @@ func selfTest() throws {
     _ = startSelection(beforeMouseDown: { afterImageReply = pageReply($0) })
     putImage(); app = "com.openai.codex"; bridge.tick()
     bridge.receive(afterImageReply)
-    assert(bridge.region != nil && bridge.regionContext?.browser == nil)
-    assert(!bridge.markdown(bridge.original!).contains("Estimated selection"), "Post-image browser context cannot supply CSS coordinates")
+    assert(bridge.region == nil && bridge.original == nil && bridge.files == nil, "Post-image browser context cannot grant screenshot eligibility")
     bridge.setEnabled(false)
     for invalidateBeforeMatch in [false, true] {
         _ = startSelection(beforeMouseDown: { id in
@@ -1877,23 +1998,22 @@ func selfTest() throws {
         let after = try Data(contentsOf: paths[1]); assert(after == before, "Completed fullscreen context is immutable")
         bridge.setEnabled(false)
     }
-    func blockPreparedRewrite() throws -> [URL] {
-        let paths = bridge.files!
-        try FileManager.default.moveItem(at: paths[1], to: paths[1].appendingPathExtension("saved"))
-        try FileManager.default.createDirectory(at: paths[1], withIntermediateDirectories: false)
-        return paths
-    }
-    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true); putImage(); bridge.tick()
-    let lateRewriteID = requested
-    app = "com.openai.codex"; bridge.tick()
-    let staleLatePaths = try blockPreparedRewrite()
-    bridge.receive(selectionReply(lateRewriteID, url: "https://example.com/late-corrected"))
-    assert(bridge.ownsClipboard() && bridge.files != staleLatePaths, "Late browser updates share the same failure recovery")
-    let correctedLateMD = try String(contentsOf: bridge.files![1], encoding: .utf8)
-    assert(correctedLateMD.contains("late-corrected"))
+    // Frozen receipts ignore late replies even if their path has become unwritable.
+    _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) })
+    putImage(); app = "com.openai.codex"; bridge.tick()
+    let frozenID = bridge.regionContext!.id, blockedPaths = bridge.files!
+    let frozenBytes = try Data(contentsOf: blockedPaths[1])
+    try FileManager.default.moveItem(at: blockedPaths[1], to: blockedPaths[1].appendingPathExtension("saved"))
+    try FileManager.default.createDirectory(at: blockedPaths[1], withIntermediateDirectories: false)
+    let blockedCount = board.changeCount
+    bridge.receive(selectionReply(frozenID, url: "https://example.com/late-corrected"))
+    assert(bridge.files == blockedPaths && bridge.ownsClipboard() && board.changeCount == blockedCount)
+    bridge.updatePreparedMarkdown()
+    assert(bridge.owned == nil && bridge.files == nil && board.data(forType: .png) == png, "An explicitly failed rewrite withdraws only owned attachments")
+    let savedFrozenBytes = try Data(contentsOf: blockedPaths[1].appendingPathExtension("saved"))
+    assert(savedFrozenBytes == frozenBytes)
     bridge.setEnabled(false)
-    print("PASS: page CSS estimates, reply/invalidation races, failed-rewrite withdrawal, raw observation preservation, and OFF/new-gesture isolation.")
-
+    print("PASS: page CSS estimates, reply/invalidation races, frozen source receipts, rewrite failure, raw observation preservation, and OFF/new-gesture isolation.")
     // Public pasteboard generations can temporarily advance for a remote overlay, then return.
     // Real private boards hold the representations; only their otherwise non-rewindable counter is injected.
     var displayedCount: Int?
@@ -1910,7 +2030,7 @@ func selfTest() throws {
         }
         assert(board.writeObjects(entries))
     }
-    let rollbackCases = ["raw", "owned", "owned-away", "empty-overlay", "deferred-overlay", "newer-equal",
+    let rollbackCases = ["raw", "owned", "owned-away", "owned-newer-equal", "owned-token", "empty-overlay", "deferred-overlay", "newer-equal",
         "changed-bytes", "changed-types", "epoch", "epoch-race", "count-race", "epoch-unavailable", "off", "expired",
         "invalidate", "invalidate-owned", "mutable-file", "returned-delayed", "returned-delayed-empty", "returned-delayed-timeout"]
     for test in rollbackCases {
@@ -1923,17 +2043,20 @@ func selfTest() throws {
             board.clearContents(); assert(board.writeObjects([item]))
         } else { putImage() }
         bridge.tick(); app = "com.openai.codex"; bridge.tick()
+        if test == "mutable-file" {
+            assert(bridge.original == nil && bridge.region == nil && bridge.suspended == nil && bridge.files == nil)
+            continue
+        }
         assert(bridge.region != nil && bridge.captureItems != nil)
         let originalFiles = bridge.files!, originalDate = bridge.observedAt, captureID = bridge.regionContext!.id
         let originalMD = try Data(contentsOf: originalFiles[1])
-        let keepOwned = ["owned", "owned-away", "invalidate-owned"].contains(test)
+        let keepOwned = ["owned", "owned-away", "invalidate-owned", "owned-newer-equal", "owned-token"].contains(test)
         if !keepOwned { app = "com.google.Chrome"; bridge.tick() }
         let generation = bridge.seen, oldItems = completePasteboardItems(board)!
         if test == "empty-overlay" || test == "returned-delayed-empty" { board.clearContents() }
         else if test == "deferred-overlay" { board.declareTypes([.png], owner: nil) }
         else { board.clearContents(); board.setString("remote overlay", forType: .string) }
         bridge.tick()
-        if test == "mutable-file" { assert(bridge.suspended == nil); continue }
         assert(bridge.suspended?.generation == generation && bridge.original == nil, test)
         if test.hasPrefix("invalidate") {
             bridge.receive(invalidate)
@@ -1948,6 +2071,7 @@ func selfTest() throws {
         var returned = oldItems
         if test == "changed-bytes" { returned[0][.png] = Data("different image data".utf8) }
         if test == "changed-types" { returned[0][.string] = Data("additional user data".utf8) }
+        if test == "owned-token" { returned[0][marker] = Data("another owner".utf8) }
         if test.hasPrefix("returned-delayed") {
             board.declareTypes([.png], owner: nil); displayedCount = generation
             bridge.tick()
@@ -1955,7 +2079,7 @@ func selfTest() throws {
             now += test == "returned-delayed-timeout" ? 2.1 : 0.2
             if test != "returned-delayed-timeout" { assert(board.setData(png, forType: .png)) }
         } else { replaceItems(returned) }
-        displayedCount = test == "newer-equal" ? bridge.observedGeneration + 1 : generation
+        displayedCount = ["newer-equal", "owned-newer-equal"].contains(test) ? bridge.observedGeneration + 1 : generation
         var epochReads = 0
         if test == "epoch-race" || test == "count-race" {
             bridge.pasteboardEpoch = {
@@ -1969,7 +2093,7 @@ func selfTest() throws {
         }
         app = test == "owned-away" ? "com.google.Chrome" : "com.openai.codex"
         bridge.tick()
-        let rejected = ["newer-equal", "changed-bytes", "changed-types", "epoch", "epoch-race", "count-race", "epoch-unavailable", "off", "expired", "returned-delayed-timeout"].contains(test)
+        let rejected = ["newer-equal", "owned-newer-equal", "owned-token", "changed-bytes", "changed-types", "epoch", "epoch-race", "count-race", "epoch-unavailable", "off", "expired", "returned-delayed-timeout"].contains(test)
         if rejected { assert(bridge.region == nil && bridge.regionContext == nil, test) }
         else {
             assert(bridge.regionContext?.id == captureID && bridge.observedAt == originalDate, test)
@@ -1990,29 +2114,33 @@ func selfTest() throws {
     for correlated in [false, true] {
         if correlated { _ = startSelection(beforeMouseDown: { bridge.receive(pageReply($0)) }) }
         else { bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true) }
-        board.declareTypes([.png], owner: nil)
-        let emptyCount = board.changeCount
+        board.declareTypes([.png], owner: nil); let emptyCount = board.changeCount
         bridge.tick()
-        assert(bridge.seen != emptyCount && bridge.original == nil && bridge.deferredImage != nil)
-        now += 0.2
-        assert(board.setData(png, forType: .png) && board.changeCount == emptyCount)
-        bridge.tick()
-        assert(bridge.original?.png == png && (bridge.region != nil) == correlated)
+        assert(bridge.original == nil)
+        if correlated { assert(bridge.seen != emptyCount && bridge.deferredImage != nil) }
+        else { assert(bridge.seen == emptyCount && bridge.deferredImage == nil) }
+        now += 0.2; assert(board.setData(png, forType: .png) && board.changeCount == emptyCount)
+        app = "com.apple.TextEdit"; bridge.tick()
+        assert((bridge.original?.png == png) == correlated && (bridge.region != nil) == correlated)
+        app = "com.openai.codex"; bridge.tick()
+        assert(bridge.ownsClipboard() == correlated)
+        if !correlated { assert(board.changeCount == emptyCount && board.data(forType: .png) == png) }
     }
-    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
+    _ = startSelection(replyBeforeEnd: true)
     board.declareTypes([.png], owner: nil); bridge.tick(); let pendingCount = board.changeCount
     now += 2.1; bridge.tick()
     assert(bridge.seen == pendingCount && bridge.deferredImage == nil && bridge.original == nil)
     board.setData(png, forType: .png); bridge.tick()
-    assert(bridge.original == nil, "Expired missing-data retries must not poll forever")
-    bridge.setEnabled(false); app = "com.google.Chrome"; bridge.setEnabled(true)
+    assert(bridge.original == nil, "Expired image data cannot restore expired screenshot eligibility")
+    _ = startSelection(replyBeforeEnd: true)
     board.declareTypes([.png], owner: nil); bridge.tick()
-    let deniedDeadline = bridge.deferredImage!.deadline, deniedCount = board.changeCount
+    let deniedCount = board.changeCount
+    assert(bridge.deferredImage != nil)
     let deniedMonitor = RegionInputMonitor(bridge: bridge, preflight: { false }, readShortcut: { .standard }, statusChanged: { _ in })
     now += 1; deniedMonitor.update(); bridge.tick()
-    assert(bridge.deferredImage?.deadline == deniedDeadline, "Permission polling must not renew a missing-image deadline")
-    now += 1.1; deniedMonitor.update(); bridge.tick()
-    assert(bridge.seen == deniedCount && bridge.deferredImage == nil && bridge.original == nil)
+    assert(bridge.seen == deniedCount && bridge.deferredImage == nil && bridge.original == nil, "Losing monitoring cancels pending eligibility instead of renewing it")
+    now += 1.1; board.setData(png, forType: .png); deniedMonitor.update(); bridge.tick()
+    assert(bridge.original == nil && board.changeCount == deniedCount)
     bridge.setEnabled(false)
     final class UnreadImageProvider: NSObject, NSPasteboardItemDataProvider {
         var reads = 0
@@ -2021,7 +2149,7 @@ func selfTest() throws {
         }
     }
     for type in [marker, NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"), NSPasteboard.PasteboardType("org.nspasteboard.TransientType")] {
-        app = "com.google.Chrome"; bridge.setEnabled(true)
+        app = "com.google.Chrome"; bridge.setEnabled(true); armScreenshot(bridge)
         let provider = UnreadImageProvider(), item = NSPasteboardItem()
         item.setDataProvider(provider, forTypes: [.png]); item.setString("private", forType: type)
         board.clearContents(); assert(board.writeObjects([item])); bridge.tick()
@@ -2045,7 +2173,7 @@ func selfTest() throws {
     assert(bridge.suspended == nil && bridge.regionContext?.id != earlierCaptureID && bridge.region != nil)
     bridge.setEnabled(false)
     bridge.pasteboardEpoch = currentPasteboardEpoch
-    print("PASS: 20 private-board rollback cases, exact generation/representations/epoch, frozen capture snapshots, ownership, and bounded deferred image data.")
+    print("PASS: 22 private-board rollback cases, exact generation/representations/epoch, frozen capture snapshots, ownership, and bounded deferred image data.")
 
     var permissionRequests = 0, inputStates: [String] = []
     let monitor = RegionInputMonitor(bridge: bridge, preflight: { false },
@@ -2104,24 +2232,26 @@ func selfTest() throws {
         random ^= random << 13; random ^= random >> 7; random ^= random << 17
         return Int(random % UInt64(limit))
     }
+    var sequenceCaptures = 0, sequencePlainCopies = 0
     for sequence in 0..<64 {
         var generation = 0, imageIndex: Int?, expectedText = "sequence-\(sequence)-initial", foreground = "com.google.Chrome"
         var replies: [[String: Any]] = []
+        var eligibleGeneration: Int?
         board.clearContents(); board.setString(expectedText, forType: .string)
         let state = Bridge(board: board, directory: directory.appendingPathComponent("sequence-\(sequence)"), currentApp: { foreground }, request: { id in
-            replies.append(["type": "browser-context", "requestId": id, "available": true,
-                            "url": "https://example.com/image/\(generation)", "window": ["focused": true]])
+            replies.append(selectionReply(id, url: "https://example.com/image/\(generation)"))
         })
+        state.clock = { now }; state.displays = { testDisplays }
         for step in 0..<64 {
-            let action = next(12), wasDisabled = !state.enabled, before = board.changeCount
+            let action = next(14), wasDisabled = !state.enabled, before = board.changeCount
             switch action {
             case 0: state.receive(["type": "enabled", "enabled": true])
-            case 1: state.receive(["type": "enabled", "enabled": false])
+            case 1: state.receive(["type": "enabled", "enabled": false]); eligibleGeneration = nil
             case 2, 3:
-                generation += 1; imageIndex = action - 2
+                generation += 1; imageIndex = action - 2; eligibleGeneration = nil; sequencePlainCopies += 1
                 board.clearContents(); board.setData(variants[imageIndex!], forType: .png)
             case 4:
-                generation += 1; imageIndex = nil; expectedText = "sequence-\(sequence)-copy-\(generation)"
+                generation += 1; imageIndex = nil; eligibleGeneration = nil; expectedText = "sequence-\(sequence)-copy-\(generation)"
                 board.clearContents(); board.setString(expectedText, forType: .string)
             case 5: foreground = "com.google.Chrome"; state.tick()
             case 6: foreground = "com.openai.codex"; state.tick()
@@ -2129,20 +2259,27 @@ func selfTest() throws {
             case 8: if !replies.isEmpty { state.receive(replies[next(replies.count)]) }
             case 9: state.tick(); state.tick()
             case 10: state.restore()
+            case 12, 13:
+                // Same-size plain copies and real observed shortcuts coexist in this state model.
+                generation += 1; imageIndex = action - 12; eligibleGeneration = nil
+                state.tick()
+                if state.enabled && foreground == "com.google.Chrome" {
+                    let id = armScreenshot(state, reply: { selectionReply($0, url: "https://example.com/image/\(generation)") })
+                    if !id.isEmpty { eligibleGeneration = generation; sequenceCaptures += 1 }
+                }
+                board.clearContents(); board.setData(variants[imageIndex!], forType: .png)
             default:
                 state.receive(["type": "enabled", "enabled": true]); state.receive(["type": "enabled", "enabled": true])
             }
             let label = "seed=0x494B49 sequence=\(sequence) step=\(step) action=\(action)"
-            if wasDisabled && !state.enabled && ![2, 3, 4].contains(action) {
+            if wasDisabled && !state.enabled && ![2, 3, 4, 12, 13].contains(action) {
                 assert(board.changeCount == before, "Disabled bridge wrote: \(label)")
             }
             if state.ownsClipboard() {
-                assert(state.enabled && foreground == "com.openai.codex" && imageIndex != nil, "Unexpected attachment: \(label)")
+                assert(state.enabled && foreground == "com.openai.codex" && imageIndex != nil && eligibleGeneration == generation, "Unexpected attachment: \(label)")
                 let bytes = try Data(contentsOf: state.files![0]), text = try String(contentsOf: state.files![1], encoding: .utf8)
                 assert(bytes == variants[imageIndex!], "Older image resurrected: \(label)")
-                if text.contains("- Page URL:") {
-                    assert(text.contains(quoted("https://example.com/image/\(generation)")), "Context belongs to an older copy: \(label)")
-                }
+                assert(text.contains(quoted("https://example.com/image/\(generation)")), "Context belongs to an older copy: \(label)")
             } else if let imageIndex {
                 assert(board.data(forType: .png) == variants[imageIndex], "Image bytes changed: \(label)")
             } else {
@@ -2151,8 +2288,9 @@ func selfTest() throws {
         }
         state.setEnabled(false)
     }
-    print("PASS: 64 deterministic state sequences × 64 actions (4096 transitions), seed=0x494B49.")
-    print("PASS: image preservation, malformed/oversized/concealed input, native framing limits, stale replies, immediate attachment, late context, restore/toggle/newer-copy ownership, and disk failure.")
+    assert(sequenceCaptures > 0 && sequencePlainCopies > 0)
+    print("PASS: 64 deterministic state sequences × 64 actions (4096 transitions), seed=0x494B49; \(sequenceCaptures) eligible gestures and \(sequencePlainCopies) plain copies.")
+    print("PASS: Chrome-only image preservation, malformed/concealed input, native framing limits, stale replies, restore/toggle/newer-copy ownership, and disk failure.")
 }
 
 if CommandLine.arguments.contains("--self-test") {

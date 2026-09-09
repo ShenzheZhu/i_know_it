@@ -13,7 +13,7 @@ function renderInput(value) {
   inputStatus.hidden = !current;
   inputStatus.textContent = {
     ready: 'Region selection monitoring is on.',
-    'permission-required': 'Allow macOS Input Monitoring to add selection coordinates. Keystrokes are not stored.',
+    'permission-required': 'Allow macOS Input Monitoring to enhance Chrome screenshots. Keystrokes are not stored.',
     unavailable: 'Region monitoring unavailable. Restart Chrome to retry.',
     off: 'Region selection monitoring is off.',
   }[value] ?? 'Companion unavailable. Reopen Chrome after installing it.';
@@ -26,7 +26,7 @@ function render(state) {
   current = state.enabled;
   toggle.checked = current;
   status.textContent = current ? 'ON' : 'OFF';
-  description.textContent = current ? 'Include a context file when pasting into Codex.' : 'Use your ordinary clipboard without added context.';
+  description.textContent = current ? 'Add context to Chrome screenshots pasted into Codex.' : 'Use your ordinary clipboard without added context.';
   renderInput(state.inputStatus);
 }
 

@@ -20,21 +20,30 @@ let board = NSPasteboard(name: NSPasteboard.Name("com.iknowit.agent-test." + UUI
 defer { board.releaseGlobally() }
 var app = "com.google.Chrome", requestID = ""
 let bridge = Bridge(board: board, directory: directory, currentApp: { app }, request: { requestID = $0 })
+var now: TimeInterval = 100
+bridge.clock = { now }
+bridge.displays = { [RegionDisplay(id: 1, bounds: CGRect(x: -1440, y: 0, width: 1440, height: 1000), scale: 2)] }
 bridge.setEnabled(true)
 let png = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
-board.clearContents(); board.setData(png, forType: .png); bridge.tick()
+// Test-only direct method calls; no OS input or native screenshot is generated.
+bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
 assert(!requestID.isEmpty)
 bridge.receive(["type":"browser-context", "requestId":requestID, "available":true,
     "url":"https://example.invalid/design-review", "title":"Design review fixture", "observedAt":iso(Date()),
     "window":["focused":true, "left":-1440, "top":30, "width":1200, "height":900],
     "viewport":["width":600,"height":400], "scroll":["x":0,"y":320], "zoom":1.25, "devicePixelRatio":2])
+bridge.observeGesture(type: .flagsChanged, flags: [])
+bridge.observeGesture(type: .leftMouseDown, flags: [], location: CGPoint(x: -1400, y: 100))
+now += 0.2
+bridge.observeGesture(type: .leftMouseUp, flags: [], location: CGPoint(x: -800, y: 500))
+board.clearContents(); board.setData(png, forType: .png); bridge.tick()
 app = "com.openai.codex"; bridge.tick()
 assert(bridge.ownsClipboard())
 let files = board.pasteboardItems!.compactMap { $0.string(forType: .fileURL) }.compactMap(URL.init(string:))
 assert(files.count == 2)
 let outputPNG = try Data(contentsOf: files[0]); assert(outputPNG == png)
 let metadata = try String(contentsOf: files[1], encoding: .utf8)
-assert(metadata.contains("1200 × 800") && metadata.contains("Screenshot source and crop origin: unknown"))
+assert(metadata.contains("1200 × 800") && metadata.contains("Screenshot source and crop origin: unknown") && metadata.contains("Observed screenshot selection"))
 print(String(data: try JSONSerialization.data(withJSONObject: files.map { $0.path }), encoding: .utf8)!)
 bridge.setEnabled(false); assert(board.data(forType: .png) == png)
 `;

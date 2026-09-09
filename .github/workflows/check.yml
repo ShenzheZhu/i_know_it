@@ -54,5 +54,5 @@ jobs:
         run: node check-process.cjs
       - name: Image size matrix
         run: node check-images.cjs
-      - name: Isolated installation and removal
+      - name: Isolated installer regression (synthetic signing protocol)
         run: node check-install.cjs

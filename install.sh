@@ -49,6 +49,12 @@ umask 077
 mkdir -p "$install_dir"
 chmod 700 "$install_dir"
 build_dir="$(mktemp -d "$install_dir/.build.XXXXXX")"
+lock_dir="$install_dir/.install-lock"
+mkdir "$lock_dir" 2>/dev/null || {
+  rmdir -- "$build_dir"
+  echo "Another installation is active, or a previous installation left $lock_dir. No helper was replaced." >&2
+  exit 1
+}
 manifest_temp=""
 replace_started=false
 replace_complete=false
@@ -62,17 +68,61 @@ cleanup() {
       fi
     done
   fi
-  for file in "$build_dir/i-know-it-host" "$build_dir/install-receipt.json" "$build_dir/main.swift" "$build_dir/i-know-it-host.previous" "$build_dir/install-receipt.json.previous" "$build_dir/manifest.json" "$manifest_temp"; do
+  for file in "$build_dir/i-know-it-host" "$build_dir/install-receipt.json" "$build_dir/main.swift" "$build_dir/i-know-it-host.previous" "$build_dir/install-receipt.json.previous" "$build_dir/manifest.json" "$build_dir"/certificate-* "$manifest_temp"; do
     [[ ! -f "$file" ]] || rm -- "$file"
   done
   rmdir -- "$build_dir" 2>/dev/null || true
+  rmdir -- "$lock_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
 hash_file() {
   local result
-  result="$(/usr/bin/shasum -a 256 -- "$1")" || return 1
+  result="$(/usr/bin/shasum -a "${2-256}" -- "$1")" || return 1
   printf '%s' "${result%% *}"
 }
+# Read the actual signature; never create or broaden a designated requirement.
+requirement_for() {
+  local details
+  details="$(/usr/bin/codesign --display -r- "$1" 2>&1)" || return 1
+  [[ "$details" == *'designated => '* ]] || return 1
+  printf '%s' "${details##*designated => }"
+}
+verify_signed() {
+  /usr/bin/codesign --verify --strict "$1" || return 1
+  /usr/bin/codesign --verify -R "=identifier \"$host_name\"" "$1" || return 1
+  rm -f -- "$build_dir"/certificate-*
+  /usr/bin/codesign --display --extract-certificates "$build_dir/certificate-" "$1" 2>/dev/null || return 1
+  [[ -f "$build_dir/certificate-0" && "$(hash_file "$build_dir/certificate-0" 1)" == "$2" ]] || return 1
+  [[ "$(requirement_for "$1")" == "$3" ]] || return 1
+}
+previous_identity="$(receipt_value signing_identity)"
+previous_requirement="$(receipt_value designated_requirement)"
+signing_identity="${IKI_SIGNING_IDENTITY-$previous_identity}"
+signing_identity="$(printf '%s' "$signing_identity" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+signing_keychain="${IKI_SIGNING_KEYCHAIN-$(receipt_value signing_keychain)}"
+if [[ -n "$previous_identity" || -n "$previous_requirement" ]]; then
+  [[ "$previous_identity" =~ ^[0-9a-f]{40}$ && -n "$previous_requirement" &&
+     "$signing_identity" == "$previous_identity" ]] || {
+    echo "The signing identity does not match the installed receipt; leaving the installation untouched." >&2
+    exit 1
+  }
+fi
+[[ "$signing_identity" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "A stable code-signing identity is required. Set IKI_SIGNING_IDENTITY to its 40-character certificate SHA-1 fingerprint." >&2
+  echo "Use security find-identity -v -p codesigning to list available identities. No helper was replaced." >&2
+  exit 1
+}
+# An old or missing receipt must not permit rotation of an already signed host.
+if [[ -f "$host_path" && -z "$previous_requirement" ]]; then
+  /usr/bin/codesign --display --extract-certificates "$build_dir/certificate-" "$host_path" 2>/dev/null || true
+  if [[ -f "$build_dir/certificate-0" ]]; then
+    previous_requirement="$(requirement_for "$host_path")"
+    verify_signed "$host_path" "$signing_identity" "$previous_requirement" || {
+      echo "The existing signed helper does not match the selected identity; leaving it untouched." >&2
+      exit 1
+    }
+  fi
+fi
 cp "$source_dir/native/main.swift" "$build_dir/main.swift"
 source_hash="$(hash_file "$build_dir/main.swift")"
 architecture="$(uname -m)"
@@ -82,7 +132,9 @@ reuse=false
 if [[ -f "$receipt_path" && -f "$host_path" && -x "$host_path" &&
       "$(receipt_value source_sha256)" == "$source_hash" &&
       "$(receipt_value architecture)" == "$architecture" &&
-      "$(receipt_value executable_sha256)" == "$installed_hash" ]]; then
+      "$(receipt_value executable_sha256)" == "$installed_hash" &&
+      -n "$previous_identity" && -n "$previous_requirement" ]] &&
+      verify_signed "$host_path" "$signing_identity" "$previous_requirement"; then
   reuse=true
   chmod 755 "$host_path"
   chmod 600 "$receipt_path"
@@ -95,6 +147,18 @@ $compiler_version
 $compiler_hash"
   /usr/bin/xcrun swiftc "$build_dir/main.swift" -o "$build_dir/i-know-it-host"
   chmod 755 "$build_dir/i-know-it-host"
+  signing_args=(--force --sign "$signing_identity" --identifier "$host_name")
+  [[ -z "$signing_keychain" ]] || signing_args+=(--keychain "$signing_keychain")
+  /usr/bin/codesign "${signing_args[@]}" "$build_dir/i-know-it-host"
+  requirement="$(requirement_for "$build_dir/i-know-it-host")"
+  verify_signed "$build_dir/i-know-it-host" "$signing_identity" "$requirement"
+  if [[ -n "$previous_requirement" ]]; then
+    /usr/bin/codesign --verify --strict -R "=$previous_requirement" "$build_dir/i-know-it-host"
+    [[ "$requirement" == "$previous_requirement" ]] || {
+      echo "The update changed its default designated requirement; leaving the installation untouched." >&2
+      exit 1
+    }
+  fi
   /usr/bin/plutil -create xml1 "$build_dir/install-receipt.json"
   /usr/bin/plutil -insert format -integer 1 "$build_dir/install-receipt.json"
   /usr/bin/plutil -insert name -string "$host_name" "$build_dir/install-receipt.json"
@@ -103,6 +167,9 @@ $compiler_hash"
   /usr/bin/plutil -insert compiler -string "$compiler_identity" "$build_dir/install-receipt.json"
   /usr/bin/plutil -insert architecture -string "$architecture" "$build_dir/install-receipt.json"
   /usr/bin/plutil -insert executable_sha256 -string "$(hash_file "$build_dir/i-know-it-host")" "$build_dir/install-receipt.json"
+  /usr/bin/plutil -insert signing_identity -string "$signing_identity" "$build_dir/install-receipt.json"
+  /usr/bin/plutil -insert signing_keychain -string "$signing_keychain" "$build_dir/install-receipt.json"
+  /usr/bin/plutil -insert designated_requirement -string "$requirement" "$build_dir/install-receipt.json"
   /usr/bin/plutil -convert json "$build_dir/install-receipt.json"
 fi
 /usr/bin/plutil -create xml1 "$build_dir/manifest.json"
@@ -135,7 +202,12 @@ echo "Installed I Know It! for Chrome and Chrome for Testing."
 if [[ "$reuse" == true ]]; then
   echo "Reused the unchanged native executable; its bytes and modification time were preserved."
 else
-  echo "Built the native executable. macOS may require Input Monitoring permission again."
+  echo "Built and verified the signed native executable."
+  if [[ -z "$previous_requirement" ]]; then
+    echo "This is the initial signed identity. macOS may require Input Monitoring authorization once."
+  else
+    echo "The update satisfies the previous version's default designated requirement."
+  fi
 fi
 echo "One-time setup: open chrome://extensions, enable Developer mode, and load this folder unpacked:"
 echo "$source_dir"

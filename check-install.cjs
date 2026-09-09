@@ -29,6 +29,10 @@ function codesignProtocol() {
   const args = process.argv.slice(2), file = args.at(-1), mode = process.env.IKI_TEST_PROTOCOL_MODE;
   fs.appendFileSync(path.join(__dirname, 'codesign.calls'), JSON.stringify(args) + '\n');
   const fail = text => { process.stderr.write('Synthetic codesign fixture: ' + text + '\n'); process.exit(1); };
+  const extraction = args.find(arg => arg.startsWith('--extract-certificates='));
+  if (args.includes('--extract-certificates') && args.length !== 3) {
+    fail('The optional certificate prefix must use --extract-certificates=PREFIX; a separated prefix is another input path');
+  }
   const cert = fs.readFileSync(path.join(__dirname, 'protocol-certificate'));
   const fingerprint = crypto.createHash('sha1').update(cert).digest('hex');
   const trailer = Buffer.from('\nIKI_SYNTHETIC_SIGNING_PROTOCOL_V1\n');
@@ -54,12 +58,13 @@ function codesignProtocol() {
     if (mode === 'verify-failure') fail(mode);
     const required = args.indexOf('-R');
     if (required >= 0 && ![`=identifier "${signature.identifier}"`, '=' + signature.requirement].includes(args[required + 1])) fail('requirement mismatch');
-  } else if (args.includes('--extract-certificates')) {
+  } else if (extraction || args.includes('--extract-certificates')) {
     if (mode === 'missing-certificate') process.exit(0);
-    const prefix = args[args.indexOf('--extract-certificates') + 1];
+    const prefix = extraction ? extraction.slice('--extract-certificates='.length) : 'codesign';
     fs.writeFileSync(prefix + '0', Buffer.from(signature.certificate, 'base64'));
   } else if (args.includes('--display') && args.includes('-r-')) {
-    process.stderr.write('designated => ' + signature.requirement + '\n');
+    process.stderr.write('Executable=' + file + '\n');
+    process.stdout.write('designated => ' + signature.requirement + '\n');
   } else fail('unexpected protocol arguments: ' + JSON.stringify(args));
 }
 // Real mode delegates to the system tool and only records arguments for reuse assertions.
@@ -155,7 +160,8 @@ function verifyInstalled(test, id) {
   assert.equal(verified.status, 0, verified.stderr);
   const requirement = spawnSync(executable, ['--display', '-r-', test.host], { encoding: 'utf8' });
   assert.equal(requirement.status, 0, requirement.stderr);
-  assert.equal((requirement.stdout + requirement.stderr).split('designated => ').at(-1).trim(), receipt.designated_requirement);
+  const requirements = [...(requirement.stdout + '\n' + requirement.stderr).matchAll(/^designated => (.+)$/gm)];
+  assert.deepEqual(requirements.map(match => match[1]), [receipt.designated_requirement]);
   assert.match(receipt.compiler, /Swift version/);
   assert.match(receipt.compiler, /\n[0-9a-f]{64}$/);
   assert.equal(receipt.architecture, spawnSync('/usr/bin/uname', ['-m'], { encoding: 'utf8' }).stdout.trim());

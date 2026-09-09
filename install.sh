@@ -106,7 +106,7 @@ verify_signed() {
   /usr/bin/codesign --verify --strict "$1" || return 1
   /usr/bin/codesign --verify -R "=identifier \"$host_name\"" "$1" || return 1
   rm -f -- "$build_dir"/certificate-*
-  /usr/bin/codesign --display --extract-certificates "$build_dir/certificate-" "$1" 2>/dev/null || return 1
+  /usr/bin/codesign --display --extract-certificates="$build_dir/certificate-" "$1" 2>/dev/null || return 1
   [[ -f "$build_dir/certificate-0" && "$(hash_file "$build_dir/certificate-0" 1)" == "$2" ]] || return 1
   [[ "$(requirement_for "$1")" == "$3" ]] || return 1
 }
@@ -129,7 +129,7 @@ fi
 }
 # An old or missing receipt must not permit rotation of an already signed host.
 if [[ -f "$host_path" && -z "$previous_requirement" ]]; then
-  /usr/bin/codesign --display --extract-certificates "$build_dir/certificate-" "$host_path" 2>/dev/null || true
+  /usr/bin/codesign --display --extract-certificates="$build_dir/certificate-" "$host_path" 2>/dev/null || true
   if [[ -f "$build_dir/certificate-0" ]]; then
     previous_requirement="$(requirement_for "$host_path")"
     verify_signed "$host_path" "$signing_identity" "$previous_requirement" || {

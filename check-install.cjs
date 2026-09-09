@@ -81,6 +81,17 @@ function calls(test, reset = false) {
   if (reset) fs.rmSync(file, { force: true });
   return result;
 }
+// Older macOS plutil can put missing-file/key diagnostics on stdout, then exit 1.
+// Keep real successful plist operations; make that failure channel deterministic everywhere.
+function plutilStdoutFailure() {
+  const { spawnSync } = require('node:child_process');
+  const result = spawnSync('/usr/bin/plutil', process.argv.slice(2), { encoding: 'utf8' });
+  if (result.error) throw result.error;
+  if (result.status === 0) {
+    process.stdout.write(result.stdout); process.stderr.write(result.stderr);
+  } else process.stdout.write('Old-plutil failure on stdout: ' + (result.stdout + result.stderr || 'operation failed\n'));
+  process.exit(result.status ?? 1);
+}
 function fixture(name) {
   const folder = path.join(root, name);
   const support = path.join(folder, 'Application Support');
@@ -90,10 +101,12 @@ function fixture(name) {
   for (const script of ['install.sh', 'uninstall.sh']) {
     let content = fs.readFileSync(path.join(__dirname, script), 'utf8');
     content = content.replaceAll('/usr/bin/codesign', '"$source_dir/codesign-fixture"');
+    content = content.replaceAll('/usr/bin/plutil', '"' + path.join(source, 'plutil-fixture').replace(/[\\$"`]/g, '\\$&') + '"');
     const prefix = '$HOME/Library/Application Support';
     assert(content.includes(prefix), `${script} must retain the known installation prefix`);
     fs.writeFileSync(path.join(source, script), content.replaceAll(prefix, support.replace(/[\\$"`]/g, '\\$&')));
   }
+  fs.writeFileSync(path.join(source, 'plutil-fixture'), '#!/usr/bin/env node\n(' + plutilStdoutFailure.toString() + ')();\n', { mode: 0o755 });
   if (!realSigning) fs.writeFileSync(path.join(source, 'protocol-certificate'), protocolCertificate);
   fs.writeFileSync(path.join(source, 'codesign-fixture'), '#!/usr/bin/env node\n('
     + (realSigning ? codesignReal : codesignProtocol).toString() + ')();\n', { mode: 0o755 });
@@ -159,6 +172,28 @@ function verifyInstalled(test, id) {
 }
 function pass(message) { passes.push(message); console.log(`PASS: ${message}`); }
 try {
+  const receiptFailure = fixture('old plutil failure stdout');
+  const currentHelper = fs.readFileSync(path.join(receiptFailure.source, 'install.sh'), 'utf8')
+    .match(/receipt_value\(\) \{[\s\S]*?\n\}/)?.[0];
+  assert(currentHelper, 'Expected the production receipt_value helper');
+  const oldHelper = 'receipt_value() { "$source_dir/plutil-fixture" -extract "$1" raw -o - "$receipt_path" 2>/dev/null || true; }';
+  const helperReceipt = path.join(receiptFailure.source, 'receipt-fixture.json');
+  function readReceiptHelper(helper, key) {
+    const result = spawnSync('/bin/bash', ['-c', 'source_dir="$1"; receipt_path="$2"; ' + helper
+      + '\nvalue="$(receipt_value "$3")"; printf "%s" "$value"', 'receipt-helper', receiptFailure.source, helperReceipt, key], { encoding: 'utf8' });
+    assert.ifError(result.error); assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  }
+  for (const missing of ['receipt', 'key']) {
+    if (missing === 'key') fs.writeFileSync(helperReceipt, JSON.stringify({ format: 1 }));
+    assert.match(readReceiptHelper(oldHelper, 'signing_identity'), /^Old-plutil failure on stdout:/,
+      'RED: old helper mistakes failed extraction diagnostics for a receipt value');
+    assert.equal(readReceiptHelper(currentHelper, 'signing_identity'), '',
+      'GREEN: missing receipt or key must remain absent despite diagnostic stdout');
+  }
+  fs.writeFileSync(helperReceipt, JSON.stringify({ signing_identity: signingIdentity }));
+  assert.equal(readReceiptHelper(currentHelper, 'signing_identity'), signingIdentity, 'Successful extraction still returns its exact value');
+  pass('old-plutil stdout diagnostic regression: old helper fails both missing-value checks; current helper passes and preserves successful values');
   const basic = fixture('install twice with spaces');
   for (const id of ['', 'invalid', 'a'.repeat(31), 'q'.repeat(32), 'a'.repeat(33)]) {
     run(basic, 'install.sh', [id], false);
@@ -341,15 +376,32 @@ try {
   pass('matching ad-hoc source/hash receipt cannot bypass the initial signing migration');
 
   const beforePublishFailure = snapshot(installedFiles);
+  const sourceBeforePublishFailure = fs.readFileSync(sourceFile);
   const publishReceipt = 'mv -f -- "$build_dir/install-receipt.json" "$receipt_path"';
   assert(installerText.includes(publishReceipt));
   fs.writeFileSync(installer, installerText.replace(publishReceipt, 'false # Injected receipt publication failure.'));
   fs.appendFileSync(path.join(basic.source, 'native/main.swift'), '\n// Force a rebuild for publication failure.\n');
-  run(basic, 'install.sh', ['a'.repeat(32)], false);
-  unchanged([basic.host, basic.receipt], beforePublishFailure.slice(0, 2));
+  run(basic, 'install.sh', ['b'.repeat(32)], false);
+  unchanged(installedFiles, beforePublishFailure);
   verifyInstalled(basic, 'a'.repeat(32));
   fs.writeFileSync(installer, installerText);
-  pass('receipt publication failure rolls back the previous host and receipt');
+  fs.writeFileSync(sourceFile, sourceBeforePublishFailure);
+  pass('receipt publication failure with a changed extension ID restores host, receipt and both registrations byte-for-byte with original mtime');
+
+  const beforeManifestFailure = snapshot(installedFiles);
+  const publishManifest = 'mv -f -- "$manifest_temp" "$directory/$host_name.json"';
+  assert(installerText.includes(publishManifest));
+  fs.writeFileSync(installer, installerText.replace(publishManifest,
+    'if [[ "$published_manifests" == 1 ]]; then echo "Injected second registration publication failure." >&2; false; else '
+    + publishManifest + '; fi'));
+  calls(basic, true);
+  const partialPublication = run(basic, 'install.sh', ['b'.repeat(32)], false);
+  assert.match(partialPublication.stderr, /Injected second registration publication failure/);
+  assert(!calls(basic).some(args => args.includes('--sign')), 'Partial registration rollback must use the unchanged signed host');
+  unchanged(installedFiles, beforeManifestFailure);
+  verifyInstalled(basic, 'a'.repeat(32));
+  fs.writeFileSync(installer, installerText);
+  pass('second registration publication failure during reuse restores the first registration and preserves all installed bytes and mtime');
   const capture = path.join(basic.app, 'captures', 'existing', 'context.md');
   fs.mkdirSync(path.dirname(capture), { recursive: true });
   fs.writeFileSync(capture, 'Keep this saved context.');

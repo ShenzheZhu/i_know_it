@@ -19,7 +19,11 @@ browser_dirs=(
 [[ -f "$source_dir/native/main.swift" ]] || { echo "Missing native/main.swift." >&2; exit 1; }
 [[ ! -L "$install_dir" && ! -L "$host_path" && ! -L "$receipt_path" ]] || { echo "Refusing to replace a symbolic link." >&2; exit 1; }
 [[ ! -e "$host_path" || -f "$host_path" ]] || { echo "Refusing to replace a non-file: $host_path" >&2; exit 1; }
-receipt_value() { /usr/bin/plutil -extract "$1" raw -o - "$receipt_path" 2>/dev/null || true; }
+receipt_value() {
+  local value
+  value="$(/usr/bin/plutil -extract "$1" raw -o - "$receipt_path" 2>/dev/null)" || return 0
+  printf '%s' "$value"
+}
 if [[ -e "$receipt_path" ]]; then
   [[ -f "$receipt_path" && "$(receipt_value format)" == 1 &&
      "$(receipt_value name)" == "$host_name" && "$(receipt_value path)" == "$host_path" ]] || {
@@ -56,6 +60,7 @@ mkdir "$lock_dir" 2>/dev/null || {
   exit 1
 }
 manifest_temp=""
+published_manifests=0
 replace_started=false
 replace_complete=false
 cleanup() {
@@ -68,7 +73,17 @@ cleanup() {
       fi
     done
   fi
-  for file in "$build_dir/i-know-it-host" "$build_dir/install-receipt.json" "$build_dir/main.swift" "$build_dir/i-know-it-host.previous" "$build_dir/install-receipt.json.previous" "$build_dir/manifest.json" "$build_dir"/certificate-* "$manifest_temp"; do
+  if [[ "$replace_complete" == false ]]; then
+    for ((index = 0; index < published_manifests; index++)); do
+      manifest="${browser_dirs[index]}/$host_name.json"
+      if [[ -f "$build_dir/registration-$index.previous" ]]; then
+        mv -f -- "$build_dir/registration-$index.previous" "$manifest"
+      else
+        rm -f -- "$manifest"
+      fi
+    done
+  fi
+  for file in "$build_dir/i-know-it-host" "$build_dir/install-receipt.json" "$build_dir/main.swift" "$build_dir/i-know-it-host.previous" "$build_dir/install-receipt.json.previous" "$build_dir/manifest.json" "$build_dir"/certificate-* "$build_dir"/registration-*.previous "$manifest_temp"; do
     [[ ! -f "$file" ]] || rm -- "$file"
   done
   rmdir -- "$build_dir" 2>/dev/null || true
@@ -182,10 +197,12 @@ fi
 for directory in "${browser_dirs[@]}"; do
   mkdir -p "$directory"
   chmod 700 "$directory"
+  [[ ! -f "$directory/$host_name.json" ]] || cp -p "$directory/$host_name.json" "$build_dir/registration-$published_manifests.previous"
   manifest_temp="$(mktemp "$directory/.i-know-it.XXXXXX")"
   cp "$build_dir/manifest.json" "$manifest_temp"
   chmod 600 "$manifest_temp"
   mv -f -- "$manifest_temp" "$directory/$host_name.json"
+  published_manifests=$((published_manifests + 1))
   manifest_temp=""
 done
 if [[ "$reuse" == false ]]; then
@@ -195,8 +212,8 @@ if [[ "$reuse" == false ]]; then
   replace_started=true
   mv -f -- "$build_dir/i-know-it-host" "$host_path"
   mv -f -- "$build_dir/install-receipt.json" "$receipt_path"
-  replace_complete=true
 fi
+replace_complete=true
 
 echo "Installed I Know It! for Chrome and Chrome for Testing."
 if [[ "$reuse" == true ]]; then

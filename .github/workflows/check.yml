@@ -46,10 +46,32 @@ jobs:
           package-manager-cache: false
       - name: Extension checks
         run: node check.cjs
+      - name: Compile native checks
+        run: xcrun swiftc native/main.swift -o "$RUNNER_TEMP/i-know-it-check"
       - name: Native state and input checks
         run: |
-          xcrun swiftc native/main.swift -o "$RUNNER_TEMP/i-know-it-check"
-          "$RUNNER_TEMP/i-know-it-check" --self-test
+          node - "$RUNNER_TEMP/i-know-it-check" <<'NODE'
+          const { spawn, spawnSync } = require('node:child_process');
+          const child = spawn(process.argv[2], ['--self-test'], { stdio: 'inherit' });
+          let timedOut = false;
+          const timer = setTimeout(() => {
+            timedOut = true;
+            console.error('Native self-test exceeded 120 seconds; collecting a stack sample.');
+            spawnSync('/usr/bin/sample', [String(child.pid), '1', '1'], {
+              stdio: 'inherit', timeout: 15000, killSignal: 'SIGKILL',
+            });
+            child.kill('SIGKILL');
+          }, 120000);
+          child.once('error', error => {
+            clearTimeout(timer);
+            console.error(error);
+            process.exitCode = 1;
+          });
+          child.once('exit', (code, signal) => {
+            clearTimeout(timer);
+            process.exitCode = timedOut || signal ? 1 : (code ?? 1);
+          });
+          NODE
       - name: Native process lifecycle
         run: node check-process.cjs
       - name: Image size matrix

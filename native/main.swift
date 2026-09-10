@@ -591,10 +591,12 @@ final class Bridge {
                         isRepeat: Bool = false, location: CGPoint = .zero) {
         guard enabled else { cancelGesture(); return }
         guard gesture.isArmed || browserApps.contains(currentApp() ?? "") else { return }
-        if owned != nil, !gesture.isArmed, type == .keyDown, !isRepeat,
+        if !gesture.isArmed, type == .keyDown, !isRepeat,
            gesture.shortcut?.matches(keycode: Int(keycode), flags: flags) == true {
-            // Settle our previous handoff before sampling the next screenshot's clipboard generation.
-            restore()
+            // Settle an unpolled external copy and our previous handoff before sampling
+            // the new shortcut's generation. Neither belongs to this selection.
+            tick()
+            if owned != nil { restore() }
         }
         let now = clock()
         if gesture.observe(type: type, flags: flags, keycode: Int(keycode), isRepeat: isRepeat,
@@ -1629,6 +1631,54 @@ func selfTest() throws {
         bridge.setEnabled(false)
     }
     print("PASS: 4 own-restoration ordering cases; next screenshot baseline and newer external clipboard ownership are preserved.")
+
+    // An ordinary Finder image may precede the next shortcut before the 50 ms
+    // poll sees it. Polling it during the new selection must not consume that selection.
+    for ordering in ["poll-before-shortcut", "poll-before-mouse-down", "poll-during-drag", "poll-after-mouse-up", "cancel-after-sync"] {
+        bridge.setEnabled(false); app = "com.apple.finder"; bridge.setEnabled(true)
+        putImage(); let finderCount = board.changeCount
+        let finderItems = completePasteboardItems(board)!
+        let foldersBefore = Set((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
+        now += 10
+        bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
+        assert(!bridge.gesture.isArmed && bridge.gestureContext == nil && board.changeCount == finderCount,
+               "An unpolled non-Chrome screenshot must not arm or rewrite the clipboard")
+        app = "com.google.Chrome"
+        if ordering == "poll-before-shortcut" { bridge.tick() }
+        bridge.observeGesture(type: .keyDown, flags: [.maskControl, .maskShift, .maskCommand], keycode: 21)
+        let id = requested
+        assert(bridge.gesture.isSelecting && bridge.gestureContext?.id == id)
+        if ordering == "poll-before-mouse-down" { bridge.tick() }
+        bridge.receive(selectionReply(id, url: "https://example.com/after-finder/\(ordering)"))
+        bridge.observeGesture(type: .flagsChanged, flags: [])
+        bridge.observeGesture(type: .leftMouseDown, flags: [], location: CGPoint(x: -80, y: -20))
+        if ordering == "poll-during-drag" || ordering == "cancel-after-sync" { bridge.tick() }
+        assert(bridge.gesture.isSelecting && bridge.gestureContext?.browser != nil,
+               "The previous Finder image must not cancel the next Chrome selection: \(ordering)")
+        assert(board.changeCount == finderCount && completePasteboardItems(board) == finderItems
+               && bridge.original == nil && bridge.files == nil,
+               "Settling an ordinary image must preserve it without creating attachments")
+        if ordering == "cancel-after-sync" {
+            bridge.observeGesture(type: .keyDown, flags: [], keycode: 53)
+            app = "com.openai.codex"; bridge.tick()
+            assert(!bridge.gesture.isArmed && bridge.original == nil && bridge.files == nil
+                   && board.changeCount == finderCount && completePasteboardItems(board) == finderItems)
+            assert(Set((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []) == foldersBefore)
+            continue
+        }
+        now += 0.2
+        bridge.observeGesture(type: .leftMouseUp, flags: [], location: CGPoint(x: -76, y: -17))
+        if ordering == "poll-after-mouse-up" { bridge.tick() }
+        putImage(); let screenshotCount = board.changeCount
+        assert(screenshotCount == finderCount + 1)
+        bridge.tick()
+        assert(bridge.region != nil && bridge.regionContext?.id == id && bridge.files == nil,
+               "The fresh Chrome image must match without toggling OFF/ON: \(ordering)")
+        app = "com.openai.codex"; bridge.tick()
+        assert(bridge.ownsClipboard() && (try! Data(contentsOf: bridge.files![0])) == png)
+        assert((try! String(contentsOf: bridge.files![1], encoding: .utf8)).contains("https://example.com/after-finder/\(ordering)"))
+    }
+    print("PASS: 5 unpolled non-Chrome copy ordering cases; the next Chrome selection survives polling and cancellation keeps ordinary paste unchanged.")
 
     // Ordinary image copies never acquire metadata, regardless of app transitions.
     var scopeChecks = 0

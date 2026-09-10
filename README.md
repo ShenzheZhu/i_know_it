@@ -6,18 +6,20 @@ This is an experimental macOS implementation. Chrome transport and clipboard beh
 
 ## Install
 
-Requires macOS and Google Chrome. Source builds also require Apple's Command Line Tools and a valid code-signing identity. This development branch does not ship a notarized companion. An unchanged verified signed installation needs neither a compiler nor access to the signing private key.
+Requires macOS and Google Chrome. A precompiled package supports only the architecture and minimum macOS version recorded in its `native/prebuilt/build.json`. A source ZIP is not a precompiled installer. Developer ID signing and notarization of a public installation package are still pending.
 
-1. Download or clone this repository. List valid identities with `security find-identity -v -p codesigning`, then run `IKI_SIGNING_IDENTITY=YOUR_CERTIFICATE_SHA1 ./install.sh` using the exact 40-character fingerprint. Set `IKI_SIGNING_KEYCHAIN` only if the identity is in a specific keychain. Subsequent installs remember these public signing settings. If no valid identity is available, installation stops without replacing the helper; it does not create or trust a certificate automatically.
+1. **Precompiled package:** extract it to a permanent folder, then double-click **Install.command**. Terminal opens for setup and shows the result. No compiler, signing key, or typed command is required. **Source checkout:** list valid identities with `security find-identity -v -p codesigning`, then run `IKI_SIGNING_IDENTITY=YOUR_CERTIFICATE_SHA1 ./install.sh` using the exact 40-character fingerprint. Source builds require Apple's Command Line Tools; set `IKI_SIGNING_KEYCHAIN` only if the identity is in a specific keychain. Subsequent source installs remember these public signing settings. If no valid identity is available, installation stops without replacing the helper; it does not create or trust a certificate automatically.
 2. Open `chrome://extensions`, enable **Developer mode**, and **Load unpacked** this folder.
 3. Pin **I Know It!** to the toolbar so its switch is always accessible.
 4. To enable Chrome screenshot context with your macOS **Copy picture of selected area to the clipboard** shortcut, click **Allow region context** in the switch panel, then allow **Input Monitoring** in macOS settings. If no system dialog appears, open **System Settings > Privacy & Security > Input Monitoring** manually. The panel shows this path after a request and reports a failed connection explicitly. The default shortcut is **Control + Shift + Command + 4**; customized bindings are read from System Settings. This is an initial setup action, separate from taking screenshots. macOS determines whether permission is attributed to Chrome or its native companion; use the entry shown by the system. When you return to Chrome after opening the permission settings, the extension reconnects its companion once to refresh cached permission state. Follow any restart instruction from macOS if the panel still reports unavailable.
+
+Packaged installs verify the binary and source hashes, declared platform compatibility, and actual signature before copying the helper. Updates must keep the installed certificate and default designated requirement. Invalid or incomplete packages stop without compiling a replacement. A transition from a local development certificate to Developer ID requires a deliberate migration; this installer does not rotate the identity or change macOS security settings. Download packages only from the trusted project release: a matching hash and a certificate named in the same package do not independently authenticate its publisher.
 
 `IKI_SIGNING_KEYCHAIN` restricts identity lookup. The certificate chain must still be resolvable through the user's normal keychain search list ([Apple's trust API notes](https://github.com/apple-oss-distributions/Security/blob/main/trust/headers/SecTrust.h#L695)). Signing also requires the keychain containing the private key to be unlocked. The installer does not change certificate trust or the keychain search list.
 
 Version 0.6.8 restricts enrichment to matched Chrome selections. It also settles its own previous clipboard restoration before observing the next shortcut, preventing that internal write from invalidating a new selection. Input Monitoring and a timely Chrome window observation are required; images without this evidence pass through unchanged. Migrating an older ad hoc installation to a signed identity may require authorization once. The extension also initializes its collector in already-open HTTP(S) pages when their current receiver is missing, then synchronizes the switch state. Healthy receivers are reused; restricted and closed pages retain the available basic observations.
 
-Version 0.6.9 also settles an earlier external clipboard change before starting a new Chrome selection. Previously, a screenshot outside Chrome could reach the clipboard just before the next Chrome shortcut, and the next polling tick could mistake that older image for the new selection and cancel its context. A private-pasteboard regression reproduces this ordering and verifies recovery without OFF/ON. Fresh installed-app acceptance is tracked in [issue #15](https://github.com/ShenzheZhu/i_know_it/issues/15).
+Version 0.6.9 also settles an earlier external clipboard change before starting a new Chrome selection. Previously, a screenshot outside Chrome could reach the clipboard just before the next Chrome shortcut, and the next polling tick could mistake that older image for the new selection and cancel its context. A private-pasteboard regression reproduces this ordering and verifies recovery without OFF/ON. Two real Finder → Chrome → Codex sequences passed without toggling or restarting the companion; the final user message preserved both attachments and fresh geometry. Acceptance is recorded in [issue #15](https://github.com/ShenzheZhu/i_know_it/issues/15).
 
 The public manifest key keeps the extension ID stable. The installer registers a local Native Messaging executable for Chrome and Chrome for Testing. Chrome starts it when the extension connects and stops it when the connection closes. There is no server, MCP, account, API key, telemetry, or network upload.
 
@@ -120,6 +122,20 @@ Version 0.5.3 follows the configured macOS region-to-clipboard shortcut, includi
 GitHub Actions runs the extension, native state, process, image-size, and installer checks on macOS 14 (Apple silicon) and macOS 15 (Intel), plus popup interaction checks in Chromium on Linux, for every push and pull request. These jobs use private fixtures and temporary installation directories; they do not need a Codex account or control a desktop agent.
 
 Version 0.6.7 addresses the remaining fullscreen CSS acceptance failure from receipt 8A56FFE2. The prior 0.6.6 receipt verified fullscreen labels and image/raw-coordinate preservation only; it did not meet the requested fullscreen CSS workflow. Fresh 0.6.7 installed-build acceptance is tracked in [issue #12](https://github.com/ShenzheZhu/i_know_it/issues/12).
+
+## Prepare a precompiled package
+
+This is a publisher command, not a recipient setup step. With Node.js and Apple's Command Line Tools available, run it from a clean, committed checkout:
+
+```sh
+node package.cjs /path/to/i-know-it-host /path/to/install-receipt.json /path/to/output.zip
+```
+
+The packager verifies an existing signed helper against its receipt and this checkout's native source, reads its actual architecture and minimum macOS target, and adds those bytes to the committed source archive. It copies only public build fields into `native/prebuilt/build.json`; local installation paths and keychain settings are excluded. It neither compiles nor signs the helper. An existing output file is not overwritten.
+
+Run `node check-package.cjs /path/to/i-know-it-host /path/to/install-receipt.json` to check packaging with a real existing signature in a disposable source checkout. It verifies archive contents, permissions and rejection paths without installing, signing, or accessing private keys. `node check-install.cjs` also covers precompiled installation with the compiler disabled, update identity checks, package corruption, and rollback. Its default signing protocol remains synthetic; neither command establishes notarization or a first-open Gatekeeper result.
+
+A local development certificate does not establish a trusted public publisher. Public distribution still needs Developer ID signing, hardened runtime, notarization, and a downloaded-package first-open check; packaging alone supplies none of these. The currently accepted local helper targets Apple silicon and macOS 26.0 or later. Testing source builds on older CI runners does not make that binary compatible with older systems. [Apple's distribution guidance](https://developer.apple.com/developer-id/) describes the signing and notarization requirements.
 
 ## License
 

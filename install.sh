@@ -83,7 +83,7 @@ cleanup() {
       fi
     done
   fi
-  for file in "$build_dir/i-know-it-host" "$build_dir/install-receipt.json" "$build_dir/main.swift" "$build_dir/i-know-it-host.previous" "$build_dir/install-receipt.json.previous" "$build_dir/manifest.json" "$build_dir"/certificate-* "$build_dir"/registration-*.previous "$manifest_temp"; do
+  for file in "$build_dir/i-know-it-host" "$build_dir/install-receipt.json" "$build_dir/main.swift" "$build_dir/prebuilt-build.json" "$build_dir/i-know-it-host.previous" "$build_dir/install-receipt.json.previous" "$build_dir/manifest.json" "$build_dir"/certificate-* "$build_dir"/registration-*.previous "$manifest_temp"; do
     [[ ! -f "$file" ]] || rm -- "$file"
   done
   rmdir -- "$build_dir" 2>/dev/null || true
@@ -115,6 +115,61 @@ previous_requirement="$(receipt_value designated_requirement)"
 signing_identity="${IKI_SIGNING_IDENTITY-$previous_identity}"
 signing_identity="$(printf '%s' "$signing_identity" | /usr/bin/tr '[:upper:]' '[:lower:]')"
 signing_keychain="${IKI_SIGNING_KEYCHAIN-$(receipt_value signing_keychain)}"
+cp "$source_dir/native/main.swift" "$build_dir/main.swift"
+source_hash="$(hash_file "$build_dir/main.swift")"
+architecture="$(uname -m)"
+prebuilt=false
+prebuilt_dir="$source_dir/native/prebuilt"
+prebuilt_hash=""
+if [[ -e "$prebuilt_dir" || -L "$prebuilt_dir" ]]; then
+  [[ -d "$prebuilt_dir" && ! -L "$prebuilt_dir" &&
+     -f "$prebuilt_dir/i-know-it-host" && ! -L "$prebuilt_dir/i-know-it-host" &&
+     -f "$prebuilt_dir/build.json" && ! -L "$prebuilt_dir/build.json" ]] || {
+    echo "The prebuilt package is incomplete or contains symbolic links. No source build was attempted." >&2
+    exit 1
+  }
+  cp "$prebuilt_dir/build.json" "$build_dir/prebuilt-build.json"
+  build_value() {
+    local value
+    value="$(/usr/bin/plutil -extract "$1" raw -o - "$build_dir/prebuilt-build.json" 2>/dev/null)" || return 0
+    printf '%s' "$value"
+  }
+  signing_identity="$(build_value signing_identity)"
+  signing_keychain="$(receipt_value signing_keychain)"
+  requirement="$(build_value designated_requirement)"
+  compiler_identity="$(build_value compiler)"
+  prebuilt_hash="$(build_value executable_sha256)"
+  minimum_macos="$(build_value minimum_macos)"
+  version="$(build_value version)"
+  [[ "$(build_value format)" == 1 && "$(build_value name)" == "$host_name" &&
+     "$version" =~ ^[0-9]+(\.[0-9]+){0,3}$ &&
+     "$version" == "$(/usr/bin/plutil -extract version raw -o - "$source_dir/manifest.json" 2>/dev/null)" &&
+     "$(build_value source_sha256)" == "$source_hash" && "$prebuilt_hash" =~ ^[0-9a-f]{64}$ &&
+     "$signing_identity" =~ ^[0-9a-f]{40}$ && -n "$requirement" && -n "$compiler_identity" &&
+     "$(build_value architecture)" == "$architecture" && "$architecture" =~ ^(arm64|x86_64)$ &&
+     "$minimum_macos" =~ ^[0-9]{1,3}\.[0-9]{1,3}(\.[0-9]{1,3})?$ ]] || {
+    echo "The prebuilt package metadata does not match this source, extension version, or Mac architecture." >&2
+    exit 1
+  }
+  current_macos="$(/usr/bin/sw_vers -productVersion)"
+  /usr/bin/awk -v current="$current_macos" -v minimum="$minimum_macos" 'BEGIN {
+    split(current, actual, "."); split(minimum, required, ".");
+    for (i = 1; i <= 3; i++) {
+      if (actual[i] + 0 > required[i] + 0) exit 0;
+      if (actual[i] + 0 < required[i] + 0) exit 1;
+    }
+  }' || { echo "This prebuilt package requires macOS $minimum_macos or later." >&2; exit 1; }
+  # The publisher records the Mach-O target. The signed hash binds the selected
+  # payload; this metadata does not independently authenticate the download.
+  cp "$prebuilt_dir/i-know-it-host" "$build_dir/i-know-it-host"
+  [[ "$(hash_file "$build_dir/i-know-it-host")" == "$prebuilt_hash" ]] &&
+    verify_signed "$build_dir/i-know-it-host" "$signing_identity" "$requirement" || {
+      echo "The prebuilt executable failed hash or signature verification. No source build was attempted." >&2
+      exit 1
+    }
+  chmod 755 "$build_dir/i-know-it-host"
+  prebuilt=true
+fi
 if [[ -n "$previous_identity" || -n "$previous_requirement" ]]; then
   [[ "$previous_identity" =~ ^[0-9a-f]{40}$ && -n "$previous_requirement" &&
      "$signing_identity" == "$previous_identity" ]] || {
@@ -129,6 +184,7 @@ fi
 }
 # An old or missing receipt must not permit rotation of an already signed host.
 if [[ -f "$host_path" && -z "$previous_requirement" ]]; then
+  rm -f -- "$build_dir"/certificate-*
   /usr/bin/codesign --display --extract-certificates="$build_dir/certificate-" "$host_path" 2>/dev/null || true
   if [[ -f "$build_dir/certificate-0" ]]; then
     previous_requirement="$(requirement_for "$host_path")"
@@ -138,9 +194,6 @@ if [[ -f "$host_path" && -z "$previous_requirement" ]]; then
     }
   fi
 fi
-cp "$source_dir/native/main.swift" "$build_dir/main.swift"
-source_hash="$(hash_file "$build_dir/main.swift")"
-architecture="$(uname -m)"
 installed_hash=""
 [[ ! -f "$host_path" ]] || installed_hash="$(hash_file "$host_path")"
 reuse=false
@@ -149,24 +202,27 @@ if [[ -f "$receipt_path" && -f "$host_path" && -x "$host_path" &&
       "$(receipt_value architecture)" == "$architecture" &&
       "$(receipt_value executable_sha256)" == "$installed_hash" &&
       -n "$previous_identity" && -n "$previous_requirement" ]] &&
+      [[ "$prebuilt" == false || "$installed_hash" == "$prebuilt_hash" ]] &&
       verify_signed "$host_path" "$signing_identity" "$previous_requirement"; then
   reuse=true
   chmod 755 "$host_path"
   chmod 600 "$receipt_path"
 else
-  compiler_path="$(/usr/bin/xcrun --find swiftc)"
-  compiler_version="$(/usr/bin/xcrun swiftc --version)"
-  compiler_hash="$(hash_file "$compiler_path")"
-  compiler_identity="$compiler_path
+  if [[ "$prebuilt" == false ]]; then
+    compiler_path="$(/usr/bin/xcrun --find swiftc)"
+    compiler_version="$(/usr/bin/xcrun swiftc --version)"
+    compiler_hash="$(hash_file "$compiler_path")"
+    compiler_identity="$compiler_path
 $compiler_version
 $compiler_hash"
-  /usr/bin/xcrun swiftc "$build_dir/main.swift" -o "$build_dir/i-know-it-host"
-  chmod 755 "$build_dir/i-know-it-host"
-  signing_args=(--force --sign "$signing_identity" --identifier "$host_name")
-  [[ -z "$signing_keychain" ]] || signing_args+=(--keychain "$signing_keychain")
-  /usr/bin/codesign "${signing_args[@]}" "$build_dir/i-know-it-host"
-  requirement="$(requirement_for "$build_dir/i-know-it-host")"
-  verify_signed "$build_dir/i-know-it-host" "$signing_identity" "$requirement"
+    /usr/bin/xcrun swiftc "$build_dir/main.swift" -o "$build_dir/i-know-it-host"
+    chmod 755 "$build_dir/i-know-it-host"
+    signing_args=(--force --sign "$signing_identity" --identifier "$host_name")
+    [[ -z "$signing_keychain" ]] || signing_args+=(--keychain "$signing_keychain")
+    /usr/bin/codesign "${signing_args[@]}" "$build_dir/i-know-it-host"
+    requirement="$(requirement_for "$build_dir/i-know-it-host")"
+    verify_signed "$build_dir/i-know-it-host" "$signing_identity" "$requirement"
+  fi
   if [[ -n "$previous_requirement" ]]; then
     /usr/bin/codesign --verify --strict -R "=$previous_requirement" "$build_dir/i-know-it-host"
     [[ "$requirement" == "$previous_requirement" ]] || {
@@ -219,7 +275,11 @@ echo "Installed I Know It! for Chrome and Chrome for Testing."
 if [[ "$reuse" == true ]]; then
   echo "Reused the unchanged native executable; its bytes and modification time were preserved."
 else
-  echo "Built and verified the signed native executable."
+  if [[ "$prebuilt" == true ]]; then
+    echo "Installed the verified prebuilt executable. No compiler or signing key was needed."
+  else
+    echo "Built and verified the signed native executable."
+  fi
   if [[ -z "$previous_requirement" ]]; then
     echo "This is the initial signed identity. macOS may require Input Monitoring authorization once."
   else

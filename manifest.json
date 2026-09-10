@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "I Know It!",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "minimum_chrome_version": "120",
   "description": "Add context to Chrome screenshots while keeping other screenshots and copies unchanged.",
   "permissions": [

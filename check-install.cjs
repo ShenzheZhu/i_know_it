@@ -9,6 +9,7 @@ assert.equal(process.platform, 'darwin', 'Installer checks require macOS and Com
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'i-know-it-install-'));
 const hostName = 'com.iknowit.bridge';
 const originalSwift = fs.readFileSync(path.join(__dirname, 'native/main.swift'));
+const originalManifest = fs.readFileSync(path.join(__dirname, 'manifest.json'));
 const key = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'))).key;
 const expectedID = [...crypto.createHash('sha256').update(Buffer.from(key, 'base64')).digest('hex').slice(0, 32)]
   .map(char => String.fromCharCode(97 + parseInt(char, 16))).join('');
@@ -103,6 +104,8 @@ function fixture(name) {
   const source = path.join(folder, 'source');
   fs.mkdirSync(path.join(source, 'native'), { recursive: true });
   fs.writeFileSync(path.join(source, 'native/main.swift'), originalSwift);
+  fs.writeFileSync(path.join(source, 'manifest.json'), originalManifest);
+  fs.copyFileSync(path.join(__dirname, 'Install.command'), path.join(source, 'Install.command'));
   for (const script of ['install.sh', 'uninstall.sh']) {
     let content = fs.readFileSync(path.join(__dirname, script), 'utf8');
     content = content.replaceAll('/usr/bin/codesign', '"$source_dir/codesign-fixture"');
@@ -141,7 +144,7 @@ function unchanged(files, before) {
     assert.equal(fs.statSync(file).mtimeMs, before[index].mtime, `${file} changed modification time`);
   });
 }
-function verifyInstalled(test, id) {
+function verifyInstalled(test, id, expectedKeychain = signingKeychain) {
   assert.equal(fs.statSync(test.app).mode & 0o777, 0o700);
   assert.equal(fs.statSync(test.host).mode & 0o777, 0o755);
   assert(fs.statSync(test.host).size > 0);
@@ -153,7 +156,7 @@ function verifyInstalled(test, id) {
   assert.match(receipt.source_sha256, /^[0-9a-f]{64}$/);
   assert.equal(receipt.executable_sha256, crypto.createHash('sha256').update(fs.readFileSync(test.host)).digest('hex'));
   assert.equal(receipt.signing_identity, signingIdentity);
-  assert.equal(receipt.signing_keychain, signingKeychain);
+  assert.equal(receipt.signing_keychain, expectedKeychain);
   assert.match(receipt.designated_requirement, /identifier "com\.iknowit\.bridge"/);
   const executable = realSigning ? '/usr/bin/codesign' : path.join(test.source, 'codesign-fixture');
   const verified = spawnSync(executable, ['--verify', '--strict', '-R', '=' + receipt.designated_requirement, test.host], { encoding: 'utf8' });
@@ -233,6 +236,82 @@ try {
   unchanged([basic.host, basic.receipt], initial);
   assert.match(repeated.stdout, /Reused the unchanged native executable/);
   pass('real Swift installation writes a private receipt; unchanged reinstall preserves executable and receipt bytes and mtime');
+
+  const prebuilt = fixture('prebuilt install without development tools');
+  const prebuiltDir = path.join(prebuilt.source, 'native/prebuilt');
+  const prebuiltMetadata = path.join(prebuiltDir, 'build.json');
+  const prebuiltHost = path.join(prebuiltDir, 'i-know-it-host');
+  function packageInstalled(donor) {
+    fs.mkdirSync(prebuiltDir, { recursive: true });
+    fs.copyFileSync(path.join(donor.source, 'native/main.swift'), path.join(prebuilt.source, 'native/main.swift'));
+    fs.copyFileSync(donor.host, prebuiltHost);
+    const receipt = JSON.parse(fs.readFileSync(donor.receipt));
+    const metadata = { format: 1, name: hostName, version: JSON.parse(originalManifest).version,
+      source_sha256: receipt.source_sha256, executable_sha256: receipt.executable_sha256,
+      signing_identity: receipt.signing_identity, designated_requirement: receipt.designated_requirement,
+      compiler: receipt.compiler, architecture: receipt.architecture, minimum_macos: '10.0' };
+    fs.writeFileSync(prebuiltMetadata, JSON.stringify(metadata));
+    return metadata;
+  }
+  const firstPackage = packageInstalled(basic);
+  const prebuiltInstallerPath = path.join(prebuilt.source, 'install.sh');
+  const prebuiltInstaller = fs.readFileSync(prebuiltInstallerPath, 'utf8')
+    .replaceAll('/usr/bin/xcrun', '"$source_dir/unavailable-compiler"');
+  fs.writeFileSync(prebuiltInstallerPath, prebuiltInstaller);
+  fs.writeFileSync(path.join(prebuilt.source, 'unavailable-compiler'),
+    '#!/bin/bash\nprintf "Compiler must not be consulted\\n" >> "$0.calls"\nexit 91\n', { mode: 0o755 });
+  function installPrebuilt(succeeds = true, script = 'install.sh', id = expectedID) {
+    calls(prebuilt, true);
+    const result = run(prebuilt, script, [id], succeeds,
+      { IKI_SIGNING_IDENTITY: undefined, IKI_SIGNING_KEYCHAIN: undefined });
+    assert(!calls(prebuilt).some(args => args.includes('--sign') || args.includes('--keychain')),
+      'Prebuilt installation cannot sign or consult a keychain');
+    assert(!fs.existsSync(path.join(prebuilt.source, 'unavailable-compiler.calls')),
+      'Prebuilt installation cannot consult the compiler, even on failures');
+    return result;
+  }
+  const firstPrebuilt = installPrebuilt(true, 'Install.command');
+  assert.match(firstPrebuilt.stdout, /Installed the verified prebuilt executable/);
+  verifyInstalled(prebuilt, expectedID, '');
+  assert.deepEqual(fs.readFileSync(prebuilt.host), fs.readFileSync(basic.host));
+  fs.utimesSync(prebuilt.host, 1, 1);
+  const prebuiltFiles = [prebuilt.host, prebuilt.receipt, ...prebuilt.manifests];
+  let prebuiltBefore = snapshot(prebuiltFiles);
+  const repeatedPrebuilt = installPrebuilt();
+  assert.match(repeatedPrebuilt.stdout, /Reused the unchanged native executable/);
+  unchanged([prebuilt.host, prebuilt.receipt], prebuiltBefore);
+  prebuiltBefore = snapshot(prebuiltFiles);
+  pass('double-click launcher installs an exact prebuilt payload without signing settings or compiler; repeated install preserves bytes and mtime');
+
+  for (const mutation of [
+    { format: 2 }, { name: 'com.other.host' }, { version: '999.0' },
+    { source_sha256: '0'.repeat(64) }, { executable_sha256: '0'.repeat(64) },
+    { signing_identity: '0'.repeat(40) }, { designated_requirement: 'identifier "unexpected"' },
+    { compiler: '' }, { architecture: firstPackage.architecture === 'arm64' ? 'x86_64' : 'arm64' },
+    { minimum_macos: 'invalid' }, { minimum_macos: '999.0' },
+  ]) {
+    fs.writeFileSync(prebuiltMetadata, JSON.stringify({ ...firstPackage, ...mutation }));
+    installPrebuilt(false);
+    unchanged(prebuiltFiles, prebuiltBefore);
+  }
+  fs.writeFileSync(prebuiltMetadata, '{invalid JSON');
+  installPrebuilt(false); unchanged(prebuiltFiles, prebuiltBefore);
+  fs.writeFileSync(prebuiltMetadata, JSON.stringify(firstPackage));
+  fs.appendFileSync(prebuiltHost, 'Corrupt downloaded payload');
+  installPrebuilt(false); unchanged(prebuiltFiles, prebuiltBefore);
+  packageInstalled(basic);
+  for (const file of [prebuiltHost, prebuiltMetadata]) {
+    const bytes = fs.readFileSync(file); fs.unlinkSync(file);
+    installPrebuilt(false); unchanged(prebuiltFiles, prebuiltBefore);
+    fs.symlinkSync(file === prebuiltHost ? basic.host : basic.receipt, file);
+    installPrebuilt(false); unchanged(prebuiltFiles, prebuiltBefore);
+    fs.unlinkSync(file); fs.writeFileSync(file, bytes);
+  }
+  const movedPrebuiltDir = prebuiltDir + '-original';
+  fs.renameSync(prebuiltDir, movedPrebuiltDir); fs.symlinkSync(movedPrebuiltDir, prebuiltDir);
+  installPrebuilt(false); unchanged(prebuiltFiles, prebuiltBefore);
+  fs.unlinkSync(prebuiltDir); fs.renameSync(movedPrebuiltDir, prebuiltDir);
+  pass('invalid prebuilt metadata, mismatched platform/source/version/signature, corrupt bytes, missing files and symlinks cannot fall back or modify an installation');
 
   const signedFiles = [basic.host, basic.receipt, ...basic.manifests];
   const signedBefore = snapshot(signedFiles);
@@ -320,6 +399,54 @@ try {
   pass(realSigning ? 'real changed-source builds retain the same signer and generated designated requirement'
     : 'synthetic signing protocol: changed-source builds retain signer/DR fields and hash final modified bytes');
 
+  packageInstalled(basic);
+  const changedPrebuilt = installPrebuilt();
+  assert.match(changedPrebuilt.stdout, /Installed the verified prebuilt executable/);
+  verifyInstalled(prebuilt, expectedID, '');
+  assert.deepEqual(fs.readFileSync(prebuilt.host), fs.readFileSync(basic.host));
+  assert.equal(JSON.parse(fs.readFileSync(prebuilt.receipt)).designated_requirement, firstPackage.designated_requirement);
+  // Model a different valid build of identical source: the source hash alone
+  // must not let an older installed executable override the selected release.
+  const sameSourceReceipt = JSON.parse(fs.readFileSync(prebuilt.receipt));
+  const secondPackage = JSON.parse(fs.readFileSync(prebuiltMetadata));
+  fs.writeFileSync(prebuilt.host, initial[0].bytes);
+  sameSourceReceipt.executable_sha256 = firstPackage.executable_sha256;
+  fs.writeFileSync(prebuilt.receipt, JSON.stringify(sameSourceReceipt));
+  const sameSourceUpdate = installPrebuilt();
+  assert.match(sameSourceUpdate.stdout, /Installed the verified prebuilt executable/);
+  assert.equal(JSON.parse(fs.readFileSync(prebuilt.receipt)).executable_sha256, secondPackage.executable_sha256);
+  assert.deepEqual(fs.readFileSync(prebuilt.host), fs.readFileSync(prebuiltHost));
+  pass('same-signer prebuilt update retains the pinned default requirement; selected payload wins even when the older receipt claims identical source');
+
+  const prebuiltUpdatedBefore = snapshot(prebuiltFiles);
+  const updateReceipt = JSON.parse(fs.readFileSync(prebuilt.receipt));
+  for (const mutation of [{ signing_identity: '0'.repeat(40) }, { designated_requirement: updateReceipt.designated_requirement + ' and identifier "unexpected"' }]) {
+    fs.writeFileSync(prebuilt.receipt, JSON.stringify({ ...updateReceipt, ...mutation }));
+    const pinnedBefore = snapshot(prebuiltFiles);
+    installPrebuilt(false); unchanged(prebuiltFiles, pinnedBefore);
+  }
+  fs.writeFileSync(prebuilt.receipt, prebuiltUpdatedBefore[1].bytes);
+  verifyInstalled(prebuilt, expectedID, '');
+  pass('prebuilt updates cannot bypass an installed signer or designated-requirement pin');
+
+  for (const [publication, replacement] of [
+    ['mv -f -- "$build_dir/install-receipt.json" "$receipt_path"', 'false # Injected prebuilt receipt failure.'],
+    ['mv -f -- "$manifest_temp" "$directory/$host_name.json"',
+      'if [[ "$published_manifests" == 1 ]]; then false; else mv -f -- "$manifest_temp" "$directory/$host_name.json"; fi'],
+  ]) {
+    // Force payload replacement while retaining the selected package and signer.
+    fs.writeFileSync(prebuilt.host, initial[0].bytes);
+    fs.writeFileSync(prebuilt.receipt, JSON.stringify({ ...updateReceipt, executable_sha256: firstPackage.executable_sha256 }));
+    const before = snapshot(prebuiltFiles);
+    assert(prebuiltInstaller.includes(publication));
+    fs.writeFileSync(prebuiltInstallerPath, prebuiltInstaller.replace(publication, replacement));
+    installPrebuilt(false, 'install.sh', 'b'.repeat(32));
+    unchanged(prebuiltFiles, before);
+  }
+  fs.writeFileSync(prebuiltInstallerPath, prebuiltInstaller);
+  installPrebuilt(); verifyInstalled(prebuilt, expectedID, '');
+  pass('prebuilt receipt and second-registration publication failures restore all installed bytes and mtime');
+
   const updatedSource = fs.readFileSync(sourceFile);
   fs.appendFileSync(sourceFile, '\n// Force staged signing failure.\n');
   for (const failure of ['sign-failure', 'missing-key', ...(!realSigning ? ['verify-failure', 'wrong-certificate', 'changed-requirement', 'missing-certificate'] : [])]) {
@@ -371,6 +498,13 @@ try {
   const oldReceipt = legacyReceipt();
   oldReceipt.executable_sha256 = crypto.createHash('sha256').update(fs.readFileSync(basic.host)).digest('hex');
   fs.writeFileSync(basic.receipt, JSON.stringify(oldReceipt));
+  fs.copyFileSync(basic.host, prebuilt.host);
+  fs.writeFileSync(prebuilt.receipt, JSON.stringify({ ...oldReceipt, path: prebuilt.host }));
+  const prebuiltMigration = installPrebuilt();
+  assert.match(prebuiltMigration.stdout, /Installed the verified prebuilt executable/);
+  verifyInstalled(prebuilt, expectedID, '');
+  assert.deepEqual(fs.readFileSync(prebuilt.host), fs.readFileSync(prebuiltHost));
+  pass('prebuilt migration from an old ad-hoc host does not mistake the payload certificate for an existing signer');
   const adhocBefore = snapshot(installedFiles);
   run(basic, 'install.sh', ['a'.repeat(32)], false, { IKI_SIGNING_IDENTITY: undefined, IKI_SIGNING_KEYCHAIN: undefined });
   unchanged(installedFiles, adhocBefore);

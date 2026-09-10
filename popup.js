@@ -6,16 +6,19 @@ const panel = document.querySelector('main');
 const inputStatus = document.querySelector('#input-status');
 const allowRegion = document.querySelector('#allow-region');
 let current;
+let inputRevision = 0;
 
 function renderInput(value) {
+  inputRevision++;
   inputStatus.hidden = !current;
   inputStatus.textContent = {
     ready: 'Region selection monitoring is on.',
-    'permission-required': 'Allow macOS Input Monitoring to add selection coordinates. Keystrokes are not stored.',
+    'permission-required': 'Allow macOS Input Monitoring to enhance Chrome screenshots. Keystrokes are not stored.',
     unavailable: 'Region monitoring unavailable. Restart Chrome to retry.',
     off: 'Region selection monitoring is off.',
   }[value] ?? 'Companion unavailable. Reopen Chrome after installing it.';
   allowRegion.hidden = !current || value !== 'permission-required';
+  allowRegion.disabled = toggle.disabled;
 }
 
 function render(state) {
@@ -23,7 +26,7 @@ function render(state) {
   current = state.enabled;
   toggle.checked = current;
   status.textContent = current ? 'ON' : 'OFF';
-  description.textContent = current ? 'Include a context file when pasting into Codex.' : 'Use your ordinary clipboard without added context.';
+  description.textContent = current ? 'Add context to Chrome screenshots pasted into Codex.' : 'Use your ordinary clipboard without added context.';
   renderInput(state.inputStatus);
 }
 
@@ -31,6 +34,7 @@ async function load() {
   try {
     render(await chrome.runtime.sendMessage({ type: 'get-state' }));
     toggle.disabled = false;
+    allowRegion.disabled = false;
   } catch {
     status.textContent = 'UNAVAILABLE';
     error.textContent = 'Reopen this panel to reconnect.';
@@ -41,6 +45,7 @@ async function load() {
 }
 
 toggle.addEventListener('change', async () => {
+  inputRevision++;
   const requested = toggle.checked;
   toggle.disabled = true;
   panel.setAttribute('aria-busy', 'true');
@@ -69,13 +74,26 @@ toggle.addEventListener('change', async () => {
 });
 
 allowRegion.addEventListener('click', async () => {
+  let revision = ++inputRevision;
   allowRegion.disabled = true;
   error.hidden = true;
-  try { await chrome.runtime.sendMessage({ type: 'request-input-access' }); }
+  try {
+    const reply = await chrome.runtime.sendMessage({ type: 'request-input-access' });
+    if (revision !== inputRevision || !current) return;
+    render(reply);
+    revision = inputRevision;
+    if (!current || reply.inputStatus !== 'permission-required') return;
+    inputStatus.textContent = reply.permissionRequestSent === true
+      ? 'If no macOS dialog appears, open System Settings > Privacy & Security > Input Monitoring, allow the entry shown by macOS, then return to Chrome.'
+      : reply.permissionRequestSent === false
+        ? 'Permission request could not be sent. Reopen this panel to retry.'
+        : 'Could not confirm the permission request. Reopen this panel to retry.';
+  }
   catch {
-    error.textContent = 'Permission request could not be sent. Reopen this panel to retry.';
-    error.hidden = false;
-  } finally { allowRegion.disabled = false; }
+    if (revision === inputRevision && current) {
+      inputStatus.textContent = 'Could not confirm the permission request. Reopen this panel to retry.';
+    }
+  } finally { if (revision === inputRevision) allowRegion.disabled = toggle.disabled; }
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {

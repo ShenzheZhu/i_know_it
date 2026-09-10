@@ -5,6 +5,7 @@ let revision = 0;
 let inputStatus = 'disconnected';
 let permissionReturn;
 let reconnectTimer;
+let lastFocusedWindowId;
 const state = () => ({ enabled, inputStatus });
 
 function updateInputStatus(status) {
@@ -31,6 +32,7 @@ function unavailable(window, tabId) {
 }
 
 function pageContext() {
+  if (typeof globalThis.__iKnowItPageContext === 'function') return globalThis.__iKnowItPageContext();
   return {
     url: location.href, title: document.title,
     viewport: { width: innerWidth, height: innerHeight },
@@ -43,12 +45,37 @@ function pageContext() {
   };
 }
 
+function invalidateGeometry() {
+  if (enabled) send({ type: 'browser-geometry-invalidated' });
+}
+
+async function updatePages() {
+  // Keep OFF effective in open pages even if persisting the setting fails.
+  try {
+    const tabs = await chrome.tabs.query({});
+    await Promise.all(tabs.filter(tab => !tab.incognito && /^https?:\/\//.test(tab.url ?? ''))
+      .map(async tab => {
+        const update = () => chrome.tabs.sendMessage(tab.id, { type: 'page-state', enabled }, { frameId: 0 });
+        try { if ((await update())?.contextReady === true) return; } catch { /* The page may predate this extension load. */ }
+        try {
+          const current = await chrome.tabs.get(tab.id);
+          if (current.incognito || !/^https?:\/\//.test(current.url ?? '')) return;
+          await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, files: ['context.js'], injectImmediately: true });
+          await update();
+        } catch { /* Restricted or closed pages retain the ordinary observation fallback. */ }
+      }));
+  } catch { /* Closing tabs or pages without our content script need no update. */ }
+}
+
 async function readContext(version, requestId) {
   const recipient = port;
   let context = unavailable();
   try {
     if (!enabled) throw new Error('Disabled');
     const window = await chrome.windows.getLastFocused({ populate: true });
+    if (lastFocusedWindowId === undefined && Number.isInteger(window?.id) && window.id >= 0) {
+      lastFocusedWindowId = window.id;
+    }
     const tab = window.tabs?.find((item) => item.active);
     context = unavailable(window, tab?.id);
     if (window.focused && !window.incognito && tab && !tab.incognito
@@ -131,6 +158,7 @@ const ready = chrome.storage.local.get({ enabled: true }).catch(() => ({ enabled
   await updateButton();
   await chrome.alarms.create('native-reconnect', { periodInMinutes: 0.5 });
   connect();
+  await updatePages();
 });
 
 let changing = ready;
@@ -143,7 +171,7 @@ function setEnabled(value) {
     revision++;
     clearTimeout(timer);
     send({ type: 'enabled', enabled });
-    await Promise.all([chrome.storage.local.set({ enabled }).catch(() => {}), updateButton()]);
+    await Promise.all([chrome.storage.local.set({ enabled }).catch(() => {}), updateButton(), updatePages()]);
     connect();
     if (enabled) refresh(true);
     return state();
@@ -156,13 +184,18 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 });
 chrome.runtime.onInstalled.addListener(() => { void ready.then(() => refresh(true)); });
 chrome.runtime.onStartup.addListener(() => { void ready.then(() => refresh(true)); });
-chrome.tabs.onActivated.addListener(() => refresh(true));
-chrome.tabs.onRemoved.addListener(() => refresh(true));
+chrome.tabs.onActivated.addListener(() => { invalidateGeometry(); refresh(true); });
+chrome.tabs.onRemoved.addListener(() => { invalidateGeometry(); refresh(true); });
 chrome.tabs.onUpdated.addListener((_id, changes, tab) => {
+  if (tab.active && (changes.status || changes.url)) invalidateGeometry();
   if (tab.active && (changes.status || changes.url || changes.title)) refresh(true);
 });
-chrome.tabs.onZoomChange.addListener(() => refresh());
+chrome.tabs.onZoomChange.addListener(() => { invalidateGeometry(); refresh(); });
 chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (Number.isInteger(windowId) && windowId >= 0) {
+    if (lastFocusedWindowId !== undefined && lastFocusedWindowId !== windowId) invalidateGeometry();
+    lastFocusedWindowId = windowId;
+  }
   if (permissionReturn && enabled && port) {
     if (windowId === chrome.windows.WINDOW_ID_NONE) permissionReturn.blurred = true;
     else if (Number.isInteger(windowId) && windowId >= 0 && permissionReturn.blurred) {
@@ -176,20 +209,32 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
   }
   refresh(true);
 });
-chrome.windows.onBoundsChanged.addListener(() => refresh(true));
+chrome.windows.onBoundsChanged.addListener(() => { invalidateGeometry(); refresh(true); });
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type === 'context-changed' && sender?.id === chrome.runtime.id
-    && sender.frameId === 0 && sender.tab?.active && !sender.tab.incognito
-    && /^https?:\/\//.test(sender.url ?? '')) refresh();
+  const pageSender = sender?.id === chrome.runtime.id && sender.frameId === 0
+    && sender.tab && !sender.tab.incognito && /^https?:\/\//.test(sender.url ?? '');
+  if (message?.type === 'get-page-state' && pageSender) {
+    void changing.then(() => sendResponse({ enabled }));
+    return true;
+  }
+  if (message?.type === 'context-changed' && pageSender && sender.tab.active) {
+    if (message.geometryChanged === true) invalidateGeometry();
+    refresh();
+  }
   if (!['get-state', 'set-enabled', 'request-input-access'].includes(message?.type)
     || sender?.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('popup.html')
     || sender.tab !== undefined || (message.type === 'set-enabled' && typeof message.enabled !== 'boolean')) return;
   const operation = message.type === 'set-enabled' ? setEnabled(message.enabled) : changing.then(() => {
-    if (message.type === 'request-input-access' && enabled && inputStatus === 'permission-required') {
-      if (send({ type: 'request-input-access' })) permissionReturn = { blurred: false };
+    if (message.type === 'request-input-access') {
+      const permissionRequestSent = enabled && inputStatus === 'permission-required'
+        && send({ type: 'request-input-access' });
+      if (permissionRequestSent) permissionReturn = { blurred: false };
+      return { ...state(), permissionRequestSent };
     }
     return state();
   });
-  void operation.then(sendResponse, () => sendResponse(state())).catch(() => {});
+  void operation.then(sendResponse, () => sendResponse({ ...state(),
+    ...(message.type === 'request-input-access' && { permissionRequestSent: false }),
+  })).catch(() => {});
   return true;
 });
